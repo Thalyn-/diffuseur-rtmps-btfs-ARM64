@@ -1,0 +1,8 @@
+﻿# =============================================================================
+# ldl_temps.txt — Liste thématique : temps
+# Description: Voyages temporels et paradoxes
+# Projet : Orbis Alternis — diffuseur-rtmps-btfs-ARM64
+# =============================================================================
+# FORMAT : http://127.0.0.1:8080/btfs/<HASH>  # Titre (Réalisateur, Année)
+# =============================================================================
+

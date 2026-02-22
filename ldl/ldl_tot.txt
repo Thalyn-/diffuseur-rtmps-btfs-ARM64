@@ -1,0 +1,44 @@
+﻿# =============================================================================
+# ldl_tot.txt — Liste De Lecture Totale
+# Description: Toutes les vidéos disponibles sur Orbis Alternis
+# Créée le : 2025
+# Projet : Orbis Alternis — diffuseur-rtmps-btfs-ARM64
+# =============================================================================
+# FORMAT :
+#   URL_BTFS_COMPLETE  # Titre (Réalisateur, Année)
+#
+# L'URL BTFS doit être complète :
+#   http://127.0.0.1:8080/btfs/<HASH_CIDv0_ou_CIDv1>
+#
+# Les lignes commençant par # sont des commentaires (ignorées).
+# Les lignes vides sont ignorées.
+# =============================================================================
+
+# --- Exemples de sources réelles (à compléter) -------------------------------
+http://127.0.0.1:8080/btfs/QmbQb1kfwEmf4sqCUcccDYHBiuvKAsE4h8LQsQJ13VvZR2  # [Titre à renseigner]
+http://127.0.0.1:8080/btfs/QmW7shMNQYCgnvNWntGTZ7cyfr3KD4uPFigXz1wWceCHd5  # [Titre à renseigner]
+
+# --- Science-Fiction classique (à compléter) ---------------------------------
+# http://127.0.0.1:8080/btfs/<HASH>  # 2001 : L'Odyssée de l'espace (Kubrick, 1968)
+# http://127.0.0.1:8080/btfs/<HASH>  # Metropolis (Lang, 1927)
+# http://127.0.0.1:8080/btfs/<HASH>  # Solaris (Tarkovski, 1972)
+# http://127.0.0.1:8080/btfs/<HASH>  # Blade Runner (Scott, 1982)
+# http://127.0.0.1:8080/btfs/<HASH>  # Brazil (Gilliam, 1985)
+# http://127.0.0.1:8080/btfs/<HASH>  # Akira (Otomo, 1988)
+# http://127.0.0.1:8080/btfs/<HASH>  # Ghost in the Shell (Oshii, 1995)
+# http://127.0.0.1:8080/btfs/<HASH>  # Dark City (Proyas, 1998)
+# http://127.0.0.1:8080/btfs/<HASH>  # eXistenZ (Cronenberg, 1999)
+
+# --- Dystopies (à compléter) -------------------------------------------------
+# http://127.0.0.1:8080/btfs/<HASH>  # 1984 (Radford, 1984)
+# http://127.0.0.1:8080/btfs/<HASH>  # Fahrenheit 451 (Truffaut, 1966)
+# http://127.0.0.1:8080/btfs/<HASH>  # THX 1138 (Lucas, 1971)
+# http://127.0.0.1:8080/btfs/<HASH>  # Alphaville (Godard, 1965)
+# http://127.0.0.1:8080/btfs/<HASH>  # Bienvenue à Gattaca (Niccol, 1997)
+
+# --- Intelligence Artificielle (à compléter) ---------------------------------
+# http://127.0.0.1:8080/btfs/<HASH>  # Colossus: The Forbin Project (Sargent, 1970)
+# http://127.0.0.1:8080/btfs/<HASH>  # WarGames (Badham, 1983)
+# http://127.0.0.1:8080/btfs/<HASH>  # A.I. Intelligence Artificielle (Spielberg, 2001)
+# http://127.0.0.1:8080/btfs/<HASH>  # Her (Jonze, 2013)
+# http://127.0.0.1:8080/btfs/<HASH>  # Ex Machina (Garland, 2014)

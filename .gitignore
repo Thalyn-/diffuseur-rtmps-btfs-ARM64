@@ -1,0 +1,31 @@
+﻿# =============================================================================
+# .gitignore — Orbis Alternis
+# =============================================================================
+
+# Clés de flux et secrets (NE JAMAIS committer !)
+conf/orbis.conf.local
+*.secret
+*.cle
+*.key
+
+# Journaux de diffusion
+journaux/*.log
+journaux/*.txt
+
+# Fichiers temporaires nginx générés
+/etc/nginx/sites-enabled/orbis-rtmp.conf
+
+# Sauvegardes automatiques
+*.bak
+*.tmp
+
+# Exports de listes de lecture
+ldl/*_export.*
+
+# Thumbnails et caches
+.DS_Store
+Thumbs.db
+__pycache__/
+
+# Rapports de diagnostic
+/tmp/orbis-diagnostic-*.txt

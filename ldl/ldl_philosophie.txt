@@ -1,0 +1,8 @@
+﻿# =============================================================================
+# ldl_philosophie.txt — Liste thématique : philosophie
+# Description: SF à vocation philosophique et existentielle
+# Projet : Orbis Alternis — diffuseur-rtmps-btfs-ARM64
+# =============================================================================
+# FORMAT : http://127.0.0.1:8080/btfs/<HASH>  # Titre (Réalisateur, Année)
+# =============================================================================
+

@@ -1,2 +1,25 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+﻿# =============================================================================
+# .gitattributes — Orbis Alternis
+# Forcer les fins de lignes Unix (LF) pour tous les fichiers texte
+# Indispensable : les scripts bash ne fonctionnent pas avec des fins CRLF (Windows)
+# =============================================================================
+
+# Règle globale : LF pour tout fichier texte
+* text=auto eol=lf
+
+# Scripts bash — LF obligatoire
+*.sh text eol=lf
+
+# Fichiers de configuration — LF obligatoire
+*.conf text eol=lf
+
+# Documentation et listes de lecture
+*.md text eol=lf
+*.txt text eol=lf
+
+# Fichiers binaires — pas de conversion
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary

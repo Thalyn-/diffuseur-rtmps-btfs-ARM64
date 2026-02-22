@@ -1,0 +1,8 @@
+﻿# =============================================================================
+# ldl_politique.txt — Liste thématique : politique
+# Description: Utopies, révolutions et structures de pouvoir
+# Projet : Orbis Alternis — diffuseur-rtmps-btfs-ARM64
+# =============================================================================
+# FORMAT : http://127.0.0.1:8080/btfs/<HASH>  # Titre (Réalisateur, Année)
+# =============================================================================
+
