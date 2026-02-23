@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # ldl_cyberpunk.txt — Liste thématique : cyberpunk
 # Description: Cyberpunk, néons et capitalism dystopique
 # Projet : Orbis Alternis — diffuseur-rtmps-btfs-ARM64

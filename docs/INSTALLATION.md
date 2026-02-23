@@ -1,4 +1,4 @@
-﻿# Installation — Orbis Alternis
+# Installation — Orbis Alternis
 
 Guide d'installation complet sur **Raspberry Pi 4** (ARM64, Raspberry Pi OS Bookworm 64 bits).
 

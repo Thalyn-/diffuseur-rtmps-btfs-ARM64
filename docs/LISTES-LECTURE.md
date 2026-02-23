@@ -1,4 +1,4 @@
-﻿# Listes de lecture — Orbis Alternis
+# Listes de lecture — Orbis Alternis
 
 Gestion complète des listes de lecture (LDL) de vidéos stockées sur BTFS.
 

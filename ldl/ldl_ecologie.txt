@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # ldl_ecologie.txt — Liste thématique : ecologie
 # Description: Effondrements écologiques et survie
 # Projet : Orbis Alternis — diffuseur-rtmps-btfs-ARM64

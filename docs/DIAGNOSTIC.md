@@ -1,4 +1,4 @@
-﻿# Diagnostic et résolution de problèmes — Orbis Alternis
+# Diagnostic et résolution de problèmes — Orbis Alternis
 
 ---
 

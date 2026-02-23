@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # ldl_anime-SF.txt — Liste thématique : anime-SF
 # Description: Animations japonaises de science-fiction
 # Projet : Orbis Alternis — diffuseur-rtmps-btfs-ARM64

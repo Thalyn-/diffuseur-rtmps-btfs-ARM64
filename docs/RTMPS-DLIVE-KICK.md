@@ -1,4 +1,4 @@
-﻿# Diffusion RTMP/RTMPS — DLive et Kick
+# Diffusion RTMP/RTMPS — DLive et Kick
 
 Guide de configuration de la diffusion vers DLive (RTMP) et Kick (RTMPS).
 

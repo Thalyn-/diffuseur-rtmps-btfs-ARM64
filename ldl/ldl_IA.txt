@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # ldl_IA.txt — Liste thématique : IA
 # Description: Intelligence artificielle, robots et singularité technologique
 # Projet : Orbis Alternis — diffuseur-rtmps-btfs-ARM64

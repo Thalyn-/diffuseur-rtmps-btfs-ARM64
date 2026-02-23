@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # ldl_simulation.txt — Liste thématique : simulation
 # Description: Réalité virtuelle, simulation et mondes numériques
 # Projet : Orbis Alternis — diffuseur-rtmps-btfs-ARM64

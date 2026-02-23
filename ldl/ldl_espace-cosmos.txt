@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # ldl_espace-cosmos.txt — Liste thématique : espace-cosmos
 # Description: Exploration spatiale, cosmologie et contact extraterrestre
 # Projet : Orbis Alternis — diffuseur-rtmps-btfs-ARM64

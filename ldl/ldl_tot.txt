@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # ldl_tot.txt — Liste De Lecture Totale
 # Description: Toutes les vidéos disponibles sur Orbis Alternis
 # Créée le : 2025

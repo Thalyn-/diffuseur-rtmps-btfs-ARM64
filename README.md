@@ -1,4 +1,4 @@
-﻿# Orbis Alternis — Diffuseur RTMPS/BTFS pour ARM64
+# Orbis Alternis — Diffuseur RTMPS/BTFS pour ARM64
 
 **Système de diffusion en continu de listes de lecture vidéo depuis BTFS vers les plateformes de streaming DLive et Kick, piloté par un Raspberry Pi 4.**
 

@@ -1,4 +1,4 @@
-﻿# BTFS — Intégration BitTorrent File System
+# BTFS — Intégration BitTorrent File System
 
 Guide d'utilisation de BTFS dans le cadre du projet Orbis Alternis.
 

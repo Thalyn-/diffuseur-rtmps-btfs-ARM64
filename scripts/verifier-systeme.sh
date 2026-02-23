@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # =============================================================================
 # verifier-systeme.sh — Vérification complète du système avant diffusion
 # =============================================================================

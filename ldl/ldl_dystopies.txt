@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # ldl_dystopies.txt — Liste thématique : dystopies
 # Description: Sociétés totalitaires, surveillance et oppression
 # Projet : Orbis Alternis — diffuseur-rtmps-btfs-ARM64

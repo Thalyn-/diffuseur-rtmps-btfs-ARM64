@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # .gitattributes — Orbis Alternis
 # Forcer les fins de lignes Unix (LF) pour tous les fichiers texte
 # Indispensable : les scripts bash ne fonctionnent pas avec des fins CRLF (Windows)

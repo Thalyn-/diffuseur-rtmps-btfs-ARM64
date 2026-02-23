@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # ldl_temps.txt — Liste thématique : temps
 # Description: Voyages temporels et paradoxes
 # Projet : Orbis Alternis — diffuseur-rtmps-btfs-ARM64

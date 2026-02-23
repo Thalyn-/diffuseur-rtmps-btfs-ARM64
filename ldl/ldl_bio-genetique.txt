@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # ldl_bio-genetique.txt — Liste thématique : bio-genetique
 # Description: Biotechnologies, génétique et ingénierie du vivant
 # Projet : Orbis Alternis — diffuseur-rtmps-btfs-ARM64

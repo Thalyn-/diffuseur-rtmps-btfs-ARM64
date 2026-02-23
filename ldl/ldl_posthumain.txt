@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # ldl_posthumain.txt — Liste thématique : posthumain
 # Description: Transhumanisme, augmentation et mutations de l'humain
 # Projet : Orbis Alternis — diffuseur-rtmps-btfs-ARM64

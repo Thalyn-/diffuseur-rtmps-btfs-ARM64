@@ -1,4 +1,4 @@
-﻿# Configuration — Orbis Alternis
+# Configuration — Orbis Alternis
 
 Référence complète de tous les paramètres de configuration du projet.
 

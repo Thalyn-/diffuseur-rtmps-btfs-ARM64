@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # ldl_40-70.txt — Liste thématique : 40-70
 # Description: SF des années 40 aux années 70
 # Projet : Orbis Alternis — diffuseur-rtmps-btfs-ARM64
