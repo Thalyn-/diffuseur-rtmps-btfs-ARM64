@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Forcer UTF-8 independant de la locale SSH
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
 # =============================================================================
 # verifier-systeme.sh — Vérification complète du système avant diffusion
 # =============================================================================
@@ -109,12 +112,12 @@ verifier_service "stunnel4"
 # --- 4. BTFS -----------------------------------------------------------------
 titre "BTFS (BitTorrent File System)"
 
-if "${CURL}" -sf --max-time 5 "${BTFS_PASSERELLE}/version" &>/dev/null; then
-    local_version=$("${CURL}" -sf --max-time 5 "${BTFS_PASSERELLE}/version" | grep -oP '"Version":"\K[^"]+' || echo "?")
-    ok "Passerelle BTFS accessible : ${BTFS_PASSERELLE} (v${local_version})"
+if "${CURL}" -sf --max-time 5 "${BTFS_API}/version" &>/dev/null; then
+    local_version=$("${CURL}" -sf --max-time 5 "${BTFS_API}/version" | grep -oP '"Version":"\K[^"]+' || echo "?")
+    ok "API BTFS accessible : ${BTFS_API} (v${local_version})"
 
     # Vérifier la connectivité réseau BTFS
-    nb_pairs=$("${CURL}" -sf --max-time 10 "${BTFS_PASSERELLE%/btfs}/api/v1/swarm/peers" 2>/dev/null | \
+    nb_pairs=$("${CURL}" -sf --max-time 10 "http://127.0.0.1:5001/api/v1/swarm/peers" 2>/dev/null | \
                grep -oP '"Addr"' | wc -l || echo 0)
     if (( nb_pairs > 0 )); then
         ok "Pairs BTFS connectés : ${nb_pairs}"
@@ -130,7 +133,7 @@ if "${CURL}" -sf --max-time 5 "${BTFS_PASSERELLE}/version" &>/dev/null; then
         avert "Test fichier BTFS : en attente (normal si fichier non encore mis en cache)"
     fi
 else
-    echec "Passerelle BTFS inaccessible. Lancer : btfs daemon --chain-id ${BTFS_CHAINE_ID}"
+    echec "API BTFS inaccessible. Lancer : btfs daemon --chain-id ${BTFS_CHAINE_ID}"
 fi
 
 # --- 5. Configuration du projet ----------------------------------------------

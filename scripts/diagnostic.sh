@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Forcer UTF-8 independant de la locale SSH
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
 # =============================================================================
 # diagnostic.sh — Outil de diagnostic et résolution de problèmes
 # =============================================================================
