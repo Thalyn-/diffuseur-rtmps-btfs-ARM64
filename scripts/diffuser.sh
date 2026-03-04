@@ -157,39 +157,44 @@ verifier_ldl() {
 verifier_btfs() {
     info "Verification du daemon BTFS..."
 
-    # --- Etape 1 : API BTFS port 5001 ----------------------------------------
-    if ! "${CURL}" -sf --max-time 5 "${BTFS_API}/version" &>/dev/null; then
-        avert "L'API BTFS ne repond pas sur ${BTFS_API}"
-        avert "Tentative de demarrage : ${BTFS_DAEMON_CMD}"
+    # --- Etape 1 : daemon BTFS actif ? (via CLI, sans auth HTTP) --------
+    # btfs version communique avec le daemon via son socket local,
+    # sans passer par le port HTTP 5001 soumis a authentification.
+    if ! command -v btfs &>/dev/null; then
+        erreur "Commande btfs introuvable. Verifiez l installation."
+        exit 1
+    fi
+
+    if ! btfs version &>/dev/null 2>&1; then
+        avert "Le daemon BTFS ne repond pas. Tentative de demarrage..."
         eval "${BTFS_DAEMON_CMD}" &>/dev/null &
         sleep "${BTFS_DELAI_DEMARRAGE}"
-        if ! "${CURL}" -sf --max-time 15 "${BTFS_API}/version" &>/dev/null; then
-            erreur "Impossible de joindre l'API BTFS : ${BTFS_API}"
-            erreur "Verifiez les ports en ecoute : ss -tlnp | grep -E '5001|8080'"
-            erreur "Relancez manuellement : ${BTFS_DAEMON_CMD}"
+        if ! btfs version &>/dev/null 2>&1; then
+            erreur "Impossible de joindre le daemon BTFS."
+            erreur "Lancez manuellement : ${BTFS_DAEMON_CMD}"
+            erreur "Puis verifiez : ss -tlnp | grep -E 5001"
             exit 1
         fi
     fi
     local version_btfs
-    version_btfs=$("${CURL}" -sf --max-time 5 "${BTFS_API}/version" 2>/dev/null \
-                   | grep -oP '"Version":"\K[^"]+' || echo "?")
-    ok "API BTFS active sur ${BTFS_API} (v${version_btfs})"
+    version_btfs=$(btfs version 2>/dev/null | grep -oP "go-btfs version: \K\S+" || echo "?")
+    ok "Daemon BTFS actif (v${version_btfs})"
 
-    # --- Etape 2 : passerelle HTTP fichiers port 8080 ------------------------
-    local code_http
-    code_http=$("${CURL}" -sf --max-time 8 -o /dev/null \
-                -w "%{http_code}" \
-                "http://127.0.0.1:${BTFS_PORT_PASSERELLE}/" 2>/dev/null || echo "000")
-
-    if [[ "${code_http}" == "000" ]]; then
-        erreur "La passerelle HTTP BTFS ne repond pas sur le port ${BTFS_PORT_PASSERELLE}"
-        erreur "  -> Verifiez : btfs config Addresses.Gateway"
-        erreur "  -> Ports actifs : ss -tlnp | grep ${BTFS_PORT_PASSERELLE}"
-        erreur "  -> Pour activer : btfs config Addresses.Gateway /ip4/127.0.0.1/tcp/${BTFS_PORT_PASSERELLE}"
-        erreur "  -> Puis redemarrer le daemon BTFS"
+    # --- Etape 2 : passerelle HTTP fichiers accessible ? -----------------
+    # BTFS 4.x exige une authentification sur les ports 5001 et 8080.
+    # On teste via btfs cat sur un hash minimal pour verifier l acces fichiers.
+    info "Test d acces fichier BTFS via btfs cat..."
+    local hash_test="${BTFS_HASH_TEST:-QmbQb1kfwEmf4sqCUcccDYHBiuvKAsE4h8LQsQJ13VvZR2}"
+    # Lire les 512 premiers octets du fichier test (timeout 15s)
+    if timeout 15 btfs cat "${hash_test}" 2>/dev/null | head -c 512 | wc -c | grep -q "^[1-9]"; then
+        ok "Acces fichier BTFS operationnel (btfs cat fonctionne)"
+    else
+        erreur "Impossible de lire un fichier BTFS via btfs cat."
+        erreur "Verifiez que le fichier est bien disponible sur le reseau :"
+        erreur "  btfs cat ${hash_test} | head -c 100"
+        erreur "  btfs pin ls (voir les fichiers epingles)"
         exit 1
     fi
-    ok "Passerelle HTTP BTFS active : ${BTFS_PASSERELLE} (HTTP ${code_http})"
 }
 
 # --- Configuration dynamique de nginx-rtmp -----------------------------------
@@ -262,17 +267,38 @@ diffuser_video() {
     local filtre_video
     filtre_video="$(construire_filtre_video)"
 
+    # --- Extraction du hash BTFS depuis l URL ----------------------------
+    # Support : URL complète http://127.0.0.1:8080/btfs/Qm... OU hash brut
+    local hash_btfs
+    if [[ "${url_source}" =~ ^https?:// ]]; then
+        hash_btfs="$(basename "${url_source}")"
+    else
+        hash_btfs="${url_source}"
+    fi
+
+    # --- FIFO pour streamer btfs cat -> FFmpeg ----------------------------
+    # BTFS 4.x exige une authentification sur ses ports HTTP (5001/8080).
+    # On utilise la CLI btfs cat qui s authentifie via le socket local,
+    # et on pipe vers FFmpeg via un tube nomme (FIFO).
+    local fifo_btfs
+    fifo_btfs="$(mktemp -u /tmp/btfs_stream_XXXX.fifo)"
+    mkfifo "${fifo_btfs}"
+
     info "----------------------------------------------------"
     info "Diffusion : ${titre}"
-    info "Source    : ${url_source}"
+    info "Source    : btfs cat ${hash_btfs}"
     info "Cible     : ${CIBLE_PLATEFORME} | Video : ${bitrate_video}k | Audio : ${bitrate_audio}k"
     info "----------------------------------------------------"
+
+    # Lancer btfs cat en arriere-plan vers le FIFO
+    btfs cat "${hash_btfs}" > "${fifo_btfs}" &
+    local pid_btfs_cat=$!
 
     local cmd_ffmpeg=(
         "${FFMPEG}"
         -hide_banner -loglevel warning -stats
         -re
-        -i "${url_source}"
+        -i "${fifo_btfs}"
     )
 
     if [[ "${WEBCAM_FILTRE_ACTIF}" == "true" ]]; then
@@ -315,6 +341,11 @@ diffuser_video() {
     local code_retour=0
     wait "${PID_FFMPEG}" || code_retour=$?
     PID_FFMPEG=""
+
+    # Nettoyage FIFO et btfs cat
+    kill "${pid_btfs_cat}" 2>/dev/null || true
+    wait "${pid_btfs_cat}" 2>/dev/null || true
+    rm -f "${fifo_btfs}"
 
     if (( code_retour == 0 )); then
         ok "Video terminee : ${titre}"
@@ -387,7 +418,8 @@ boucle_principale() {
 
             local tentative=1 source_ok=false
             while (( tentative <= TENTATIVES_RECONNEXION )); do
-                if "${CURL}" -sf --max-time 15 --head "${url}" &>/dev/null; then
+                local _hash_verif; _hash_verif="$(basename "${url}")"
+                if timeout 12 btfs cat "${_hash_verif}" 2>/dev/null | head -c 128 | wc -c | grep -q "^[1-9]"; then
                     source_ok=true; break
                 fi
                 avert "Source inaccessible (tentative ${tentative}/${TENTATIVES_RECONNEXION}) : ${url}"
