@@ -198,29 +198,99 @@ verifier_btfs() {
 
 # --- Configuration dynamique de nginx-rtmp -----------------------------------
 generer_config_nginx() {
-    info "Generation de la configuration nginx-rtmp..."
-    local conf_src="${PROJET_DIR}/conf/nginx-rtmp.conf"
-    local conf_dst="/etc/nginx/sites-enabled/orbis-rtmp.conf"
-    local conf_tmp
-    conf_tmp="$(mktemp)"
+    info "Configuration nginx (module RTMP)..."
+    local nginx_conf="/etc/nginx/nginx.conf"
+    local rtmp_bloc="/etc/nginx/orbis-rtmp-block.conf"
+    local stats_conf="/etc/nginx/sites-enabled/orbis-stats.conf"
 
-    sed \
-        -e "s|NGINX_PORT_RTMP|${NGINX_PORT_RTMP}|g" \
-        -e "s|NGINX_CHEMIN_APPLICATION|${NGINX_CHEMIN_APPLICATION}|g" \
-        -e "s|DLIVE_SERVEUR|${DLIVE_SERVEUR}|g" \
-        -e "s|DLIVE_CLE_FLUX|${DLIVE_CLE_FLUX}|g" \
-        -e "s|STUNNEL_PORT_LOCAL|${STUNNEL_PORT_LOCAL}|g" \
-        -e "s|KICK_CLE_FLUX|${KICK_CLE_FLUX}|g" \
-        "${conf_src}" > "${conf_tmp}"
+    # --- 1. Supprimer l ancien fichier mal place (sites-enabled ne peut pas
+    #        contenir de blocs rtmp/events/load_module = niveau racine nginx)
+    for f_mauvais in "/etc/nginx/sites-enabled/orbis-rtmp.conf" \
+                    "/etc/nginx/sites-enabled/orbis-rtmp"; do
+        [[ -f "${f_mauvais}" ]] && sudo rm -f "${f_mauvais}" && \
+            info "Suppression de l ancien fichier mal place : ${f_mauvais}"
+    done
 
-    [[ "${DLIVE_ACTIF}" != "true" ]] && sed -i '/push.*dlive/d' "${conf_tmp}"
-    [[ "${KICK_ACTIF}"  != "true" ]] && sed -i '/push.*11935/d' "${conf_tmp}"
+    # --- 2. Activer load_module ngx_rtmp dans nginx.conf -------------------
+    if sudo grep -q "^load_module.*ngx_rtmp" "${nginx_conf}" 2>/dev/null; then
+        ok "Module RTMP deja actif dans ${nginx_conf}"
+    elif sudo grep -q "ngx_rtmp" "${nginx_conf}" 2>/dev/null; then
+        # Ligne presente mais commentee -> decommenter
+        sudo sed -i \
+            "s|^[[:space:]]*#.*load_module.*ngx_rtmp_module.*|load_module modules/ngx_rtmp_module.so;|" \
+            "${nginx_conf}"
+        ok "Module RTMP active (decommente) dans ${nginx_conf}"
+    else
+        # Absent -> ajouter en premiere ligne
+        sudo sed -i "1s|^|load_module modules/ngx_rtmp_module.so;\n|" "${nginx_conf}"
+        ok "Module RTMP ajoute en tete de ${nginx_conf}"
+    fi
 
-    sudo cp "${conf_tmp}" "${conf_dst}"
-    rm -f "${conf_tmp}"
-    sudo nginx -t 2>>"${JOURNAL}" || { erreur "Configuration nginx invalide."; exit 1; }
+    # --- 3. Generer le bloc rtmp {} avec les vraies valeurs ----------------
+    # (pas de template sed : on ecrit directement avec echo)
+    {
+        echo "# Genere par Orbis Alternis le $(date +"%Y-%m-%d %H:%M:%S")"
+        echo "# Ne pas editer -- relancer diffuser.sh pour mettre a jour"
+        echo "rtmp {"
+        echo "    server {"
+        echo "        listen ${NGINX_PORT_RTMP};"
+        echo "        chunk_size 4096;"
+        echo "        max_message 1M;"
+        echo ""
+        echo "        application ${NGINX_CHEMIN_APPLICATION} {"
+        echo "            live on;"
+        echo "            record off;"
+        echo "            allow publish 127.0.0.1;"
+        echo "            deny publish all;"
+        echo "            allow play all;"
+        if [[ "${DLIVE_ACTIF}" == "true" ]]; then
+            echo "            push ${DLIVE_SERVEUR}/${DLIVE_CLE_FLUX};"
+        fi
+        if [[ "${KICK_ACTIF}" == "true" ]]; then
+            echo "            push rtmp://127.0.0.1:${STUNNEL_PORT_LOCAL}/app/${KICK_CLE_FLUX};"
+        fi
+        echo "        }"
+        echo "    }"
+        echo "}"
+    } | sudo tee "${rtmp_bloc}" > /dev/null
+    ok "Bloc RTMP genere : ${rtmp_bloc}"
+
+    # --- 4. Inclure le bloc rtmp dans nginx.conf (apres http {}, au niveau racine)
+    if ! sudo grep -q "orbis-rtmp-block.conf" "${nginx_conf}" 2>/dev/null; then
+        echo "" | sudo tee -a "${nginx_conf}" > /dev/null
+        echo "# Orbis Alternis -- bloc RTMP (inclus au niveau racine, hors http {})" \
+            | sudo tee -a "${nginx_conf}" > /dev/null
+        echo "include ${rtmp_bloc};" | sudo tee -a "${nginx_conf}" > /dev/null
+        ok "Include rtmp ajoute dans ${nginx_conf} (apres http {})"
+    else
+        ok "Include rtmp deja present dans ${nginx_conf}"
+    fi
+
+    # --- 5. Serveur HTTP stats (dans sites-enabled, a l interieur de http {})
+    {
+        echo "# Stats nginx-rtmp -- Orbis Alternis"
+        echo "server {"
+        echo "    listen 8088;"
+        echo "    server_name localhost;"
+        echo "    location /stat {"
+        echo "        rtmp_stat all;"
+        echo "        rtmp_stat_stylesheet stat.xsl;"
+        echo "    }"
+        echo "    location /controle {"
+        echo "        rtmp_control all;"
+        echo "    }"
+        echo "}"
+    } | sudo tee "${stats_conf}" > /dev/null
+    ok "Stats HTTP nginx-rtmp configurees : ${stats_conf}"
+
+    # --- 6. Validation et rechargement -------------------------------------
+    if ! sudo nginx -t 2>>"${JOURNAL}"; then
+        erreur "Configuration nginx invalide."
+        erreur "Verifiez : sudo nginx -T 2>&1 | head -40"
+        exit 1
+    fi
     sudo systemctl reload nginx
-    ok "nginx-rtmp reconfigure et rechargee."
+    ok "nginx recharge avec la configuration RTMP."
 }
 
 # --- Demarrage de Stunnel ----------------------------------------------------
