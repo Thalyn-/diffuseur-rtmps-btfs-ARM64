@@ -203,34 +203,52 @@ generer_config_nginx() {
     local rtmp_bloc="/etc/nginx/orbis-rtmp-block.conf"
     local stats_conf="/etc/nginx/sites-enabled/orbis-stats.conf"
 
-    # --- 1. Supprimer l ancien fichier mal place (sites-enabled ne peut pas
-    #        contenir de blocs rtmp/events/load_module = niveau racine nginx)
-    for f_mauvais in "/etc/nginx/sites-enabled/orbis-rtmp.conf" \
-                    "/etc/nginx/sites-enabled/orbis-rtmp"; do
-        [[ -f "${f_mauvais}" ]] && sudo rm -f "${f_mauvais}" && \
-            info "Suppression de l ancien fichier mal place : ${f_mauvais}"
+    # --- 1. Nettoyer les fichiers mal places de sessions precedentes -------
+    for f_ancien in "/etc/nginx/sites-enabled/orbis-rtmp.conf" \
+                   "/etc/nginx/sites-enabled/orbis-rtmp"; do
+        [[ -f "${f_ancien}" ]] && sudo rm -f "${f_ancien}" && \
+            info "Ancien fichier supprime : ${f_ancien}"
     done
 
-    # --- 2. Activer load_module ngx_rtmp dans nginx.conf -------------------
-    if sudo grep -q "^load_module.*ngx_rtmp" "${nginx_conf}" 2>/dev/null; then
-        ok "Module RTMP deja actif dans ${nginx_conf}"
-    elif sudo grep -q "ngx_rtmp" "${nginx_conf}" 2>/dev/null; then
-        # Ligne presente mais commentee -> decommenter
-        sudo sed -i \
-            "s|^[[:space:]]*#.*load_module.*ngx_rtmp_module.*|load_module modules/ngx_rtmp_module.so;|" \
-            "${nginx_conf}"
-        ok "Module RTMP active (decommente) dans ${nginx_conf}"
-    else
-        # Absent -> ajouter en premiere ligne
-        sudo sed -i "1s|^|load_module modules/ngx_rtmp_module.so;\n|" "${nginx_conf}"
-        ok "Module RTMP ajoute en tete de ${nginx_conf}"
+    # --- 2. Gestion du module RTMP -----------------------------------------
+    # Sur Raspberry Pi OS, libnginx-mod-rtmp installe automatiquement
+    # /etc/nginx/modules-enabled/50-mod-rtmp.conf (charge via include deja present).
+    # load_module dans nginx.conf est une alternative mais DOIT etre en ligne 1.
+    # On retire toute tentative precedente ratee (load_module mal positionne).
+    if sudo grep -q "load_module.*ngx_rtmp" "${nginx_conf}" 2>/dev/null; then
+        # Verifier si c est bien la ligne 1
+        local ligne1
+        ligne1=$(sudo head -1 "${nginx_conf}")
+        if [[ "${ligne1}" =~ load_module.*ngx_rtmp ]]; then
+            ok "Module RTMP : load_module deja en ligne 1 de ${nginx_conf}"
+        else
+            # Mal positionne (ex: ligne 7 apres user/worker) -> supprimer
+            info "Suppression load_module mal positionne dans ${nginx_conf}..."
+            sudo sed -i "/.*load_module.*ngx_rtmp_module.*/d" "${nginx_conf}"
+            info "load_module supprime (le module sera charge via modules-enabled/)"
+        fi
+    fi
+
+    # Verifier que le module est bien charge (via modules-enabled/ ou ligne 1)
+    local module_ok=false
+    if [[ -f /etc/nginx/modules-enabled/50-mod-rtmp.conf ]] || \
+       [[ -f /usr/lib/nginx/modules/ngx_rtmp_module.so && \
+          -n "$(ls /etc/nginx/modules-enabled/ 2>/dev/null | grep rtmp)" ]]; then
+        ok "Module RTMP charge via /etc/nginx/modules-enabled/ (libnginx-mod-rtmp)"
+        module_ok=true
+    fi
+
+    if [[ "${module_ok}" == "false" ]]; then
+        # Dernier recours : inserer en toute premiere ligne
+        if ! sudo grep -q "^load_module.*ngx_rtmp" "${nginx_conf}"; then
+            sudo sed -i "1s|^|load_module modules/ngx_rtmp_module.so;\n|" "${nginx_conf}"
+            ok "Module RTMP ajoute en ligne 1 de ${nginx_conf}"
+        fi
     fi
 
     # --- 3. Generer le bloc rtmp {} avec les vraies valeurs ----------------
-    # (pas de template sed : on ecrit directement avec echo)
     {
-        echo "# Genere par Orbis Alternis le $(date +"%Y-%m-%d %H:%M:%S")"
-        echo "# Ne pas editer -- relancer diffuser.sh pour mettre a jour"
+        echo "# Genere par Orbis Alternis le $(date +\"%Y-%m-%d %H:%M:%S\")"
         echo "rtmp {"
         echo "    server {"
         echo "        listen ${NGINX_PORT_RTMP};"
@@ -243,50 +261,40 @@ generer_config_nginx() {
         echo "            allow publish 127.0.0.1;"
         echo "            deny publish all;"
         echo "            allow play all;"
-        if [[ "${DLIVE_ACTIF}" == "true" ]]; then
+        [[ "${DLIVE_ACTIF}" == "true" ]] && \
             echo "            push ${DLIVE_SERVEUR}/${DLIVE_CLE_FLUX};"
-        fi
-        if [[ "${KICK_ACTIF}" == "true" ]]; then
+        [[ "${KICK_ACTIF}"  == "true" ]] && \
             echo "            push rtmp://127.0.0.1:${STUNNEL_PORT_LOCAL}/app/${KICK_CLE_FLUX};"
-        fi
         echo "        }"
         echo "    }"
         echo "}"
     } | sudo tee "${rtmp_bloc}" > /dev/null
     ok "Bloc RTMP genere : ${rtmp_bloc}"
 
-    # --- 4. Inclure le bloc rtmp dans nginx.conf (apres http {}, au niveau racine)
+    # --- 4. Inclure le bloc rtmp en fin de nginx.conf (niveau racine) ------
     if ! sudo grep -q "orbis-rtmp-block.conf" "${nginx_conf}" 2>/dev/null; then
-        echo "" | sudo tee -a "${nginx_conf}" > /dev/null
-        echo "# Orbis Alternis -- bloc RTMP (inclus au niveau racine, hors http {})" \
+        printf "\n# Orbis Alternis -- bloc RTMP\ninclude %s;\n" "${rtmp_bloc}" \
             | sudo tee -a "${nginx_conf}" > /dev/null
-        echo "include ${rtmp_bloc};" | sudo tee -a "${nginx_conf}" > /dev/null
-        ok "Include rtmp ajoute dans ${nginx_conf} (apres http {})"
+        ok "Include rtmp ajoute dans ${nginx_conf}"
     else
         ok "Include rtmp deja present dans ${nginx_conf}"
     fi
 
-    # --- 5. Serveur HTTP stats (dans sites-enabled, a l interieur de http {})
+    # --- 5. Serveur HTTP stats (server{} valide dans http{} -> sites-enabled)
     {
-        echo "# Stats nginx-rtmp -- Orbis Alternis"
         echo "server {"
         echo "    listen 8088;"
         echo "    server_name localhost;"
-        echo "    location /stat {"
-        echo "        rtmp_stat all;"
-        echo "        rtmp_stat_stylesheet stat.xsl;"
-        echo "    }"
-        echo "    location /controle {"
-        echo "        rtmp_control all;"
-        echo "    }"
+        echo "    location /stat { rtmp_stat all; rtmp_stat_stylesheet stat.xsl; }"
+        echo "    location /controle { rtmp_control all; }"
         echo "}"
     } | sudo tee "${stats_conf}" > /dev/null
-    ok "Stats HTTP nginx-rtmp configurees : ${stats_conf}"
+    ok "Stats HTTP nginx-rtmp : port 8088"
 
-    # --- 6. Validation et rechargement -------------------------------------
+    # --- 6. Validation et rechargement ------------------------------------
     if ! sudo nginx -t 2>>"${JOURNAL}"; then
         erreur "Configuration nginx invalide."
-        erreur "Verifiez : sudo nginx -T 2>&1 | head -40"
+        erreur "Diagnostic complet : sudo nginx -T 2>&1 | head -50"
         exit 1
     fi
     sudo systemctl reload nginx
