@@ -157,44 +157,43 @@ verifier_ldl() {
 verifier_btfs() {
     info "Verification du daemon BTFS..."
 
-    # --- Etape 1 : daemon BTFS actif ? (via CLI, sans auth HTTP) --------
-    # btfs version communique avec le daemon via son socket local,
-    # sans passer par le port HTTP 5001 soumis a authentification.
+    # Etape 1 : daemon actif ? (via CLI locale, sans HTTP)
     if ! command -v btfs &>/dev/null; then
-        erreur "Commande btfs introuvable. Verifiez l installation."
+        erreur "Commande btfs introuvable. Consultez docs/BTFS.md"
         exit 1
     fi
-
     if ! btfs version &>/dev/null 2>&1; then
-        avert "Le daemon BTFS ne repond pas. Tentative de demarrage..."
+        avert "Daemon BTFS inactif. Tentative de demarrage..."
         eval "${BTFS_DAEMON_CMD}" &>/dev/null &
         sleep "${BTFS_DELAI_DEMARRAGE}"
         if ! btfs version &>/dev/null 2>&1; then
-            erreur "Impossible de joindre le daemon BTFS."
+            erreur "Impossible de demarrer le daemon BTFS."
             erreur "Lancez manuellement : ${BTFS_DAEMON_CMD}"
-            erreur "Puis verifiez : ss -tlnp | grep -E 5001"
             exit 1
         fi
     fi
     local version_btfs
-    version_btfs=$(btfs version 2>/dev/null | grep -oP "go-btfs version: \K\S+" || echo "?")
+    version_btfs=$(btfs version 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+-?[a-zA-Z0-9]*" | head -1 || echo "?")
     ok "Daemon BTFS actif (v${version_btfs})"
 
-    # --- Etape 2 : passerelle HTTP fichiers accessible ? -----------------
-    # BTFS 4.x exige une authentification sur les ports 5001 et 8080.
-    # On teste via btfs cat sur un hash minimal pour verifier l acces fichiers.
-    info "Test d acces fichier BTFS via btfs cat..."
-    local hash_test="${BTFS_HASH_TEST:-QmbQb1kfwEmf4sqCUcccDYHBiuvKAsE4h8LQsQJ13VvZR2}"
-    # Lire les 512 premiers octets du fichier test (timeout 15s)
-    if timeout 15 btfs cat "${hash_test}" 2>/dev/null | head -c 512 | wc -c | grep -q "^[1-9]"; then
-        ok "Acces fichier BTFS operationnel (btfs cat fonctionne)"
-    else
-        erreur "Impossible de lire un fichier BTFS via btfs cat."
-        erreur "Verifiez que le fichier est bien disponible sur le reseau :"
-        erreur "  btfs cat ${hash_test} | head -c 100"
-        erreur "  btfs pin ls (voir les fichiers epingles)"
-        exit 1
-    fi
+    # Etape 2 : passerelle HTTP fichiers accessible ?
+    # IMPORTANT : en BTFS 4.x, / retourne 401 mais /btfs/<HASH> fonctionne.
+    # On teste donc directement avec un hash reel (les 512 premiers octets).
+    info "Test passerelle HTTP BTFS sur ${BTFS_PASSERELLE}..."
+    local url_test="${BTFS_PASSERELLE}/${BTFS_HASH_TEST}"
+    local code_http
+    code_http=$("${CURL}" -sf --max-time 20 --range "0-511" \
+                -o /dev/null -w "%{http_code}" "${url_test}" 2>/dev/null || echo "000")
+    case "${code_http}" in
+        200|206) ok "Passerelle HTTP BTFS accessible : ${BTFS_PASSERELLE} (HTTP ${code_http})" ;;
+        000)     erreur "Passerelle HTTP BTFS muette sur le port ${BTFS_PORT_PASSERELLE}"
+                 erreur "  ss -tlnp | grep ${BTFS_PORT_PASSERELLE}"
+                 exit 1 ;;
+        401)     erreur "Passerelle HTTP BTFS retourne 401 meme sur les fichiers."
+                 erreur "  Verifiez la config BTFS : btfs config Addresses.Gateway"
+                 exit 1 ;;
+        *)       avert "Passerelle HTTP BTFS : code inattendu ${code_http} (on continue)" ;;
+    esac
 }
 
 # --- Configuration dynamique de nginx-rtmp -----------------------------------
@@ -267,38 +266,20 @@ diffuser_video() {
     local filtre_video
     filtre_video="$(construire_filtre_video)"
 
-    # --- Extraction du hash BTFS depuis l URL ----------------------------
-    # Support : URL complète http://127.0.0.1:8080/btfs/Qm... OU hash brut
-    local hash_btfs
-    if [[ "${url_source}" =~ ^https?:// ]]; then
-        hash_btfs="$(basename "${url_source}")"
-    else
-        hash_btfs="${url_source}"
-    fi
-
-    # --- FIFO pour streamer btfs cat -> FFmpeg ----------------------------
-    # BTFS 4.x exige une authentification sur ses ports HTTP (5001/8080).
-    # On utilise la CLI btfs cat qui s authentifie via le socket local,
-    # et on pipe vers FFmpeg via un tube nomme (FIFO).
-    local fifo_btfs
-    fifo_btfs="$(mktemp -u /tmp/btfs_stream_XXXX.fifo)"
-    mkfifo "${fifo_btfs}"
-
     info "----------------------------------------------------"
     info "Diffusion : ${titre}"
-    info "Source    : btfs cat ${hash_btfs}"
+    info "Source    : ${url_source}"
     info "Cible     : ${CIBLE_PLATEFORME} | Video : ${bitrate_video}k | Audio : ${bitrate_audio}k"
     info "----------------------------------------------------"
 
-    # Lancer btfs cat en arriere-plan vers le FIFO
-    btfs cat "${hash_btfs}" > "${fifo_btfs}" &
-    local pid_btfs_cat=$!
-
+    # FFmpeg lit directement depuis la passerelle HTTP BTFS.
+    # Note : en BTFS 4.x, /btfs/<HASH> fonctionne sans auth
+    # (seul le chemin racine / retourne 401).
     local cmd_ffmpeg=(
         "${FFMPEG}"
         -hide_banner -loglevel warning -stats
         -re
-        -i "${fifo_btfs}"
+        -i "${url_source}"
     )
 
     if [[ "${WEBCAM_FILTRE_ACTIF}" == "true" ]]; then
@@ -334,7 +315,7 @@ diffuser_video() {
         -f flv "${url_rtmp_local}"
     )
 
-    debug "Commande : ${cmd_ffmpeg[*]}"
+    debug "Commande FFmpeg : ${cmd_ffmpeg[*]}"
 
     "${cmd_ffmpeg[@]}" 2>>"${JOURNAL}" &
     PID_FFMPEG=$!
@@ -342,15 +323,10 @@ diffuser_video() {
     wait "${PID_FFMPEG}" || code_retour=$?
     PID_FFMPEG=""
 
-    # Nettoyage FIFO et btfs cat
-    kill "${pid_btfs_cat}" 2>/dev/null || true
-    wait "${pid_btfs_cat}" 2>/dev/null || true
-    rm -f "${fifo_btfs}"
-
     if (( code_retour == 0 )); then
         ok "Video terminee : ${titre}"
     else
-        avert "FFmpeg termine avec le code ${code_retour} pour : ${titre}"
+        avert "FFmpeg code ${code_retour} pour : ${titre}"
     fi
     return ${code_retour}
 }
@@ -418,8 +394,8 @@ boucle_principale() {
 
             local tentative=1 source_ok=false
             while (( tentative <= TENTATIVES_RECONNEXION )); do
-                local _hash_verif; _hash_verif="$(basename "${url}")"
-                if timeout 12 btfs cat "${_hash_verif}" 2>/dev/null | head -c 128 | wc -c | grep -q "^[1-9]"; then
+                # Tester les 512 premiers octets de l URL HTTP BTFS (pas HEAD car BTFS repond mieux a GET)
+                if "${CURL}" -sf --max-time 20 --range "0-511" -o /dev/null "${url}" 2>/dev/null; then
                     source_ok=true; break
                 fi
                 avert "Source inaccessible (tentative ${tentative}/${TENTATIVES_RECONNEXION}) : ${url}"
