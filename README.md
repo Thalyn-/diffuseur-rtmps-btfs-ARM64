@@ -115,6 +115,63 @@ Pour l'installation complète, voir **[docs/INSTALLATION.md](docs/INSTALLATION.m
 
 ---
 
+## Dépannage
+
+### Erreur "Input/output error" lors de la diffusion RTMP
+
+Si vous recevez cette erreur, cela signifie que FFmpeg ne peut pas envoyer le flux vers nginx-rtmp.
+
+**Diagnostic rapide :**
+
+```bash
+./scripts/diagnostic.sh --rtmp
+```
+
+Cela va vérifier :
+- ✓ nginx est-il actif ?
+- ✓ Le port RTMP (1935) est-il ouvert ?
+- ✓ La config nginx est-elle valide ?
+- ✓ Le module RTMP est-il chargé ?
+- ✓ Le bloc RTMP est-il généré ?
+
+**Correction automatique :**
+
+```bash
+sudo ./scripts/fixer-rtmp.sh
+```
+
+Ce script va corriger automatiquement les problèmes courants :
+1. Installer le module nginx-rtmp s'il manque
+2. Générer le bloc RTMP avec vos clés de flux
+3. Inclure le bloc dans la config nginx
+4. Recharger nginx
+5. Tester la connexion
+
+**Après correction :**
+
+```bash
+./scripts/diagnostic.sh --ffmpeg
+```
+
+Pour tester que RTMP fonctionne avec FFmpeg.
+
+**Guide complet :** Voir **[docs/RESOLUTION-RTMP.md](docs/RESOLUTION-RTMP.md)**
+
+### Autres diagnostics
+
+```bash
+# Diagnostic complet (système, BTFS, RTMP, FFmpeg)
+./scripts/diagnostic.sh --complet
+
+# Afficher les derniers journaux
+./scripts/diagnostic.sh --journaux
+
+# Diagnostiquer BTFS spécifiquement
+./scripts/diagnostic.sh --btfs
+```
+
+---
+
 ## Options de diffusion
 
 ```bash
@@ -128,6 +185,20 @@ Pour l'installation complète, voir **[docs/INSTALLATION.md](docs/INSTALLATION.m
   -f              Activer le filigrane (logo)
   -w              Activer la surcouche webcam
 ```
+
+---
+
+## Problèmes courants
+
+| Problème | Solution |
+|----------|----------|
+| FFmpeg code 251 (Input/output error) | `sudo ./scripts/fixer-rtmp.sh` |
+| nginx ne démarre pas | `sudo systemctl status nginx` |
+| Port 1935 ne répond pas | Vérifier : `ss -tlnp \| grep 1935` |
+| BTFS inaccessible | `btfs daemon --chain-id 1029` |
+| Clés de flux non acceptées | Vérifier dans `conf/orbis.conf` |
+
+Pour un dépannage détaillé, consultez **[docs/RESOLUTION-RTMP.md](docs/RESOLUTION-RTMP.md)**.
 
 ---
 

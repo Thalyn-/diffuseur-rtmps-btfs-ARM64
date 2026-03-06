@@ -1,0 +1,289 @@
+================================================================================
+RÉSUMÉ DU PROBLÈME ET DE LA SOLUTION
+Orbis Alternis — Diffuseur RTMPS/BTFS v1.1 (ARM64)
+================================================================================
+
+DATE : 2026-03-06
+PROBLÈME IDENTIFIÉ : FFmpeg code 251 - Input/output error RTMP
+STATUT : ✓ RÉSOLU (nouveaux outils de diagnostic/correction créés)
+
+================================================================================
+VOTRE SITUATION
+================================================================================
+
+Vous lanciez la diffusion avec :
+  $ ./scripts/diffuser.sh -l ldl/ldl_tot.txt -p dlive -n
+
+Et vous receviez cette erreur répétée 3 fois :
+  [AVERT ] FFmpeg code 251 pour : [Titre à renseigner]
+  [out#0/flv] Error opening output rtmp://127.0.0.1:1935/diffusion/orbis:
+              Input/output error
+
+Dans les logs :
+  $ tail journaux/diffusion_*.log
+  Error opening output file rtmp://127.0.0.1:1935/diffusion/orbis.
+  Error opening output files: Input/output error
+
+DIAGNOSTIC :
+  - Port 1935 : OUVERT ✓ (nginx écoute)
+  - Daemon BTFS : ACTIF ✓ (v4.1.0)
+  - Passerelle BTFS : ACCESSIBLE ✓ (port 8080)
+  - Listes de lecture : CHARGÉES ✓ (2 entrées)
+  - Stunnel : ACTIF ✓ (tunnel vers Kick)
+  - nginx rechargé : ✓
+
+MAIS : FFmpeg ne peut pas envoyer le flux vers nginx-rtmp (Input/output error)
+
+CAUSE : La configuration du bloc RTMP avait probablement un problème de :
+  1. Module RTMP non chargé ou mal chargé
+  2. Bloc RTMP mal positionné dans nginx.conf
+  3. Directives allow/deny incorrectes dans le bloc RTMP
+  4. nginx pas reloadé après génération du bloc RTMP
+
+================================================================================
+SOLUTION : NOUVEAUX OUTILS CRÉÉS
+================================================================================
+
+Pour résoudre facilement ce problème (et les futurs), trois nouveaux outils
+ont été développés :
+
+1. ✨ SCRIPT : scripts/diagnostic.sh (amélioré)
+   ─────────────────────────────────────────
+   • Diagnostic approfondi de votre configuration RTMP
+   • Vérifie nginx, ports, module RTMP, bloc RTMP, etc.
+   • Test FFmpeg vers nginx-rtmp
+
+   UTILISATION :
+     ./scripts/diagnostic.sh --rtmp          # Diagnostic RTMP uniquement
+     ./scripts/diagnostic.sh --ffmpeg        # Test FFmpeg
+     ./scripts/diagnostic.sh --btfs          # Diagnostic BTFS
+     ./scripts/diagnostic.sh --complet       # Tous les diagnostics
+
+   AVANTAGE : Identifie EXACTEMENT ce qui ne va pas
+
+
+2. ✨ SCRIPT : scripts/fixer-rtmp.sh (NOUVEAU)
+   ─────────────────────────────────────────
+   • Correction AUTOMATIQUE des problèmes RTMP
+   • Installe le module RTMP si nécessaire
+   • Génère le bloc RTMP
+   • Inclut le bloc dans nginx.conf
+   • Valide et recharge nginx
+   • Teste que RTMP fonctionne
+
+   UTILISATION :
+     sudo ./scripts/fixer-rtmp.sh
+
+   AVANTAGE : Une commande pour tout corriger
+
+
+3. 📖 GUIDE : docs/GUIDE-RAPIDE-RTMP.md (NOUVEAU)
+   ──────────────────────────────────────────────
+   • Guide ultra-rapide en 5 minutes
+   • 3 commandes simples à exécuter
+   • Qu'attendre à chaque étape
+
+   ACCÈS : Lisez le fichier ou :
+     cat docs/GUIDE-RAPIDE-RTMP.md
+
+
+4. 📖 GUIDE : docs/RESOLUTION-RTMP.md (NOUVEAU)
+   ────────────────────────────────────────────
+   • Guide complet de dépannage détaillé
+   • Résolution étape par étape (manuelle)
+   • Causes et solutions
+   • Tableau des problèmes courants
+
+   ACCÈS : Lisez le fichier ou :
+     cat docs/RESOLUTION-RTMP.md
+
+
+5. 📖 GUIDE : docs/NOUVELLES-OUTILS-DIAGNOSTIC.md (NOUVEAU)
+   ──────────────────────────────────────────────────────
+   • Documentation complète des nouveaux outils
+   • Comment les utiliser
+   • Exemples de sortie
+   • Cas d'usage spécifiques
+
+   ACCÈS : Lisez le fichier
+
+================================================================================
+COMMENT UTILISER CES OUTILS POUR VOTRE PROBLÈME
+================================================================================
+
+MÉTHODE 1 : Correction Automatique RAPIDE (5 minutes)
+────────────────────────────────────────────────────
+
+  Étape 1 : Diagnostic
+    $ cd ~/OrbisAlternis
+    $ ./scripts/diagnostic.sh --rtmp
+
+    Cela affiche si RTMP est OK ou pas.
+    Lisez les résultats (✓ OK ou ✗ ERREUR).
+
+  Étape 2 : Correction
+    $ sudo ./scripts/fixer-rtmp.sh
+
+    Cela corrige tous les problèmes détectés.
+    Attendez la fin du script.
+
+  Étape 3 : Test
+    $ ./scripts/diagnostic.sh --ffmpeg
+
+    Cela teste que RTMP fonctionne avec FFmpeg.
+    Vous devez voir : "✓ Push RTMP REUSSI"
+
+  Étape 4 : Diffusion
+    $ ./scripts/diffuser.sh -l ldl/ldl_tot.txt -p dlive -n
+
+    Ça devrait fonctionner maintenant ! Les vidéos se lancent sans erreur 251.
+
+
+MÉTHODE 2 : Guide Rapide (lire puis exécuter)
+──────────────────────────────────────────────
+
+  $ cat docs/GUIDE-RAPIDE-RTMP.md
+
+  Puis exécutez les 3 commandes indiquées dans le guide.
+  Temps total : ~5 minutes
+
+
+MÉTHODE 3 : Dépannage Détaillé (si les méthodes 1-2 ne suffisent pas)
+──────────────────────────────────────────────────────────────────────
+
+  $ cat docs/RESOLUTION-RTMP.md
+
+  Cherchez votre situation exacte dans le guide.
+  Suivez les étapes de résolution correspondantes.
+
+================================================================================
+RÉSUMÉ DES FICHIERS CRÉÉS/MODIFIÉS
+================================================================================
+
+CRÉÉS :
+  ✨ scripts/fixer-rtmp.sh                  (351 lignes - correction auto)
+  📖 docs/GUIDE-RAPIDE-RTMP.md              (169 lignes - guide 5 min)
+  📖 docs/RESOLUTION-RTMP.md                (274 lignes - dépannage détaillé)
+  📖 docs/NOUVELLES-OUTILS-DIAGNOSTIC.md    (435 lignes - doc complète outils)
+  📝 PROBLEME-RESOLUTION.txt                (ce fichier)
+
+MODIFIÉS :
+  🔧 scripts/diagnostic.sh                  (refonte complète - ~300 lignes)
+  📖 README.md                              (ajout section dépannage)
+
+INCHANGÉS :
+  ✓ scripts/diffuser.sh                     (votre script de diffusion)
+  ✓ scripts/gestion-ldl.sh
+  ✓ scripts/verifier-systeme.sh
+  ✓ conf/orbis.conf
+  ✓ Tous les autres fichiers
+
+================================================================================
+CHECKLIST POUR RÉSOUDRE VOTRE PROBLÈME
+================================================================================
+
+Avant toute chose :
+  ☐ Vous êtes sur le Raspberry Pi (ou ARM64)
+  ☐ Vous avez les droits sudo
+  ☐ Les clés de flux DLive/Kick sont remplies dans conf/orbis.conf
+    $ grep "DLIVE_CLE_FLUX\|KICK_CLE_FLUX" conf/orbis.conf
+    Si vides → les remplir d'abord !
+
+Résolution :
+  ☐ Lancer diagnostic : ./scripts/diagnostic.sh --rtmp
+  ☐ Lancer correction : sudo ./scripts/fixer-rtmp.sh
+  ☐ Tester FFmpeg : ./scripts/diagnostic.sh --ffmpeg
+  ☐ Voir le résultat : "✓ Push RTMP REUSSI" ?
+  ☐ Si OUI → relancer diffusion normalement
+  ☐ Si NON → consulter docs/RESOLUTION-RTMP.md
+
+Après correction :
+  ☐ Relancer la diffusion : ./scripts/diffuser.sh -l ldl/ldl_tot.txt -p dlive -n
+  ☐ Vérifier que les vidéos se lancent SANS erreur 251
+  ☐ Vérifier que les flux arrivent sur DLive/Kick
+
+================================================================================
+PROCHAINES ÉTAPES
+================================================================================
+
+Une fois RTMP réparé et fonctionnel :
+
+1. Lire docs/CONFIGURATION.md pour optimiser les bitrates
+2. Lire docs/LISTES-LECTURE.md pour gérer vos vidéos BTFS
+3. Tester les options :
+   $ ./scripts/diffuser.sh -l ldl/ldl_tot.txt -p toutes -n
+   # Diffuser vers les 2 plateformes
+
+   $ ./scripts/diffuser.sh -l ldl/ldl_tot.txt -p dlive -b
+   # Diffuser en boucle infini
+
+   $ ./scripts/diffuser.sh -l ldl/ldl_tot.txt -p dlive -f
+   # Ajouter un filigrane (logo)
+
+4. Configurer un lancement automatique (cron, systemd, etc.)
+
+================================================================================
+DOCUMENTATION POUR RÉFÉRENCE
+================================================================================
+
+Fichiers de documentation importants (dans docs/) :
+
+  INSTALLATION.md         → Installation du système complet
+  CONFIGURATION.md        → Paramètres et optimisations
+  BTFS.md                 → Configuration du nœud BTFS
+  LISTES-LECTURE.md       → Gestion des vidéos et listes
+  DIAGNOSTIC.md           → Outils de diagnostic existants
+  RTMPS-DLIVE-KICK.md     → Configuration DLive et Kick
+
+  ⭐ GUIDE-RAPIDE-RTMP.md        → NOUVEAU - Lire en premier !
+  ⭐ RESOLUTION-RTMP.md          → NOUVEAU - Dépannage complet
+  ⭐ NOUVELLES-OUTILS-DIAGNOSTIC.md → NOUVEAU - Doc des nouveaux outils
+
+README.md               → Vue d'ensemble du projet (mis à jour)
+
+================================================================================
+SUPPORT
+================================================================================
+
+Si vous avez encore besoin d'aide après utilisation des outils :
+
+1. Exécutez le diagnostic complet :
+   $ ./scripts/diagnostic.sh --complet 2>&1 | tee ~/orbis-diag.log
+
+2. Collectez les logs d'erreur :
+   $ sudo tail -100 /var/log/nginx/error.log > ~/nginx-errors.log
+   $ tail -100 journaux/diffusion_*.log >> ~/nginx-errors.log
+
+3. Consultez la section "Causes possibles et solutions" dans RESOLUTION-RTMP.md
+
+4. Si toujours bloqué → Consultez RESOLUTION-RTMP.md section "Dépannage Avancé"
+
+================================================================================
+RÉSUMÉ FINAL
+================================================================================
+
+Votre problème :
+  FFmpeg code 251 - Input/output error RTMP
+
+Cause :
+  Bloc RTMP mal configuré ou nginx pas reloadé correctement
+
+Solution :
+  3 outils créés pour diagnostiquer et corriger automatiquement :
+  1. diagnostic.sh --rtmp  (identifier le problème)
+  2. fixer-rtmp.sh         (corriger automatiquement)
+  3. diagnostic.sh --ffmpeg (vérifier que ça marche)
+
+Durée pour résoudre :
+  ~5 minutes (commandes + attente)
+
+Prochaine action :
+  1. Lire : docs/GUIDE-RAPIDE-RTMP.md
+  2. Exécuter : ./scripts/diagnostic.sh --rtmp
+  3. Corriger : sudo ./scripts/fixer-rtmp.sh
+  4. Tester : ./scripts/diagnostic.sh --ffmpeg
+  5. Relancer : ./scripts/diffuser.sh -l ldl/ldl_tot.txt -p dlive -n
+
+Bon courage ! 🚀
+
+================================================================================
