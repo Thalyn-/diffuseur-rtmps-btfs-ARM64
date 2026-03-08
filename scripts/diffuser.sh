@@ -366,9 +366,17 @@ diffuser_video() {
     # FFmpeg lit directement depuis la passerelle HTTP BTFS.
     # Note : en BTFS 4.x, /btfs/<HASH> fonctionne sans auth
     # (seul le chemin racine / retourne 401).
+    #
+    # Options de lecture reseau :
+    #   -probesize 5M / -analyzeduration 5M : analyse rapide du flux entrant
+    #   -fflags +genpts : regenerer les PTS manquants (evite les sauts)
+    #   -re : lire a vitesse reelle (indispensable pour le streaming live)
     local cmd_ffmpeg=(
         "${FFMPEG}"
-        -hide_banner -loglevel warning -stats
+        -hide_banner -loglevel warning
+        -probesize 5M
+        -analyzeduration 5M
+        -fflags +genpts
         -re
         -i "${url_source}"
     )
@@ -418,16 +426,43 @@ diffuser_video() {
     cmd_ffmpeg+=(
         -r "${DEBIT_IMAGES}"
         -c:a aac -b:a "${bitrate_audio}k" -ar 44100 -ac 2
+        # Reduire la latence cote sortie RTMP :
+        #   -flvflags no_duration_filesize : ne pas ecrire duree/taille (live)
+        #   -flush_packets 1              : vider le buffer reseau apres chaque paquet
+        -flvflags no_duration_filesize
+        -flush_packets 1
         -f flv "${url_rtmp_local}"
     )
 
     debug "Commande FFmpeg : ${cmd_ffmpeg[*]}"
 
-    "${cmd_ffmpeg[@]}" 2>>"${JOURNAL}" &
+    # Lancer FFmpeg :
+    # - stderr -> journal ET console (tee) pour voir la progression en direct
+    # - stdout -> /dev/null
+    # La progression (-stats) s affiche sur stderr une ligne mise a jour
+    # toute les secondes (frame= fps= bitrate= time= speed=).
+    local fifo_log
+    fifo_log="$(mktemp -u /tmp/orbis_ffmpeg_XXXXXX.fifo)"
+    mkfifo "${fifo_log}"
+
+    # Lecteur du FIFO : ecrit dans le journal ET dans le terminal
+    # Le \r en fin de ligne de -stats est remplace par \n pour le journal
+    tee -a "${JOURNAL}" < "${fifo_log}" &
+    local pid_tee=$!
+
+    "${cmd_ffmpeg[@]}" 2>"${fifo_log}" &
     PID_FFMPEG=$!
+
     local code_retour=0
     wait "${PID_FFMPEG}" || code_retour=$?
     PID_FFMPEG=""
+
+    # Attendre que tee ait fini d ecrire
+    wait "${pid_tee}" 2>/dev/null || true
+    rm -f "${fifo_log}"
+
+    # Ligne vide pour separer la progression de la ligne suivante
+    echo "" >&2
 
     if (( code_retour == 0 )); then
         ok "Video terminee : ${titre}"
@@ -438,39 +473,38 @@ diffuser_video() {
 }
 
 # --- Chargement de la liste de lecture ---------------------------------------
+# Remplit les tableaux globaux LDL_URLS[] et LDL_TITRES[]
+# (evite le passage par fichiers temporaires et les problemes de desync)
 lire_liste_lecture() {
     local fichier="$1"
-    local -a urls=() titres=()
+    LDL_URLS=()
+    LDL_TITRES=()
 
     while IFS= read -r ligne; do
         [[ -z "${ligne}" ]] && continue
         [[ "${ligne}" =~ ^[[:space:]]*# ]] && continue
         local url titre
         url="$(echo "${ligne}" | sed 's/[[:space:]]*#.*//' | xargs)"
-        titre="$(echo "${ligne}" | grep -oP '(?<=#\s?).*' | xargs 2>/dev/null || echo "Sans titre")"
+        titre="$(echo "${ligne}" | grep -oP '(?<=#\s{0,5}).*' | xargs 2>/dev/null || true)"
         [[ -z "${titre}" ]] && titre="$(basename "${url}")"
         if [[ "${url}" =~ ^https?:// ]]; then
-            urls+=("${url}"); titres+=("${titre}")
+            LDL_URLS+=("${url}")
+            LDL_TITRES+=("${titre}")
         fi
     done < "${fichier}"
 
     if [[ "${OPT_MELANGE}" == "true" ]]; then
         info "Melange aleatoire de la liste..."
         local -a idx_melanges
-        mapfile -t idx_melanges < <(for i in "${!urls[@]}"; do echo "$i"; done | shuf)
+        mapfile -t idx_melanges < <(for i in "${!LDL_URLS[@]}"; do echo "$i"; done | shuf)
         local -a urls_tmp=() titres_tmp=()
         for i in "${idx_melanges[@]}"; do
-            urls_tmp+=("${urls[$i]}")
-            titres_tmp+=("${titres[$i]}")
+            urls_tmp+=("${LDL_URLS[$i]}")
+            titres_tmp+=("${LDL_TITRES[$i]}")
         done
-        urls=("${urls_tmp[@]}"); titres=("${titres_tmp[@]}")
+        LDL_URLS=("${urls_tmp[@]}")
+        LDL_TITRES=("${titres_tmp[@]}")
     fi
-
-    local tmp_urls tmp_titres
-    tmp_urls="$(mktemp)"; tmp_titres="$(mktemp)"
-    printf '%s\n' "${urls[@]}" > "${tmp_urls}"
-    printf '%s\n' "${titres[@]}" > "${tmp_titres}"
-    echo "${tmp_urls}:${tmp_titres}"
 }
 
 # --- Boucle principale -------------------------------------------------------
@@ -484,25 +518,37 @@ boucle_principale() {
 
     local tour=1 continuer=true
 
+    # Tableaux globaux remplis par lire_liste_lecture()
+    declare -g -a LDL_URLS=()
+    declare -g -a LDL_TITRES=()
+
     while [[ "${continuer}" == "true" ]]; do
         info "--- Tour n${tour} de la liste de lecture ---"
 
-        local fichiers_tmp
-        fichiers_tmp="$(lire_liste_lecture "${LDL_FICHIER}")"
-        local tmp_urls="${fichiers_tmp%%:*}"
-        local tmp_titres="${fichiers_tmp##*:}"
-        local index=0 total
-        total="$(wc -l < "${tmp_urls}")"
+        # Recharger la liste a chaque tour (permet les mises a jour a chaud)
+        lire_liste_lecture "${LDL_FICHIER}"
+        local total="${#LDL_URLS[@]}"
 
-        while IFS= read -r url && IFS= read -r titre <&3; do
-            index=$(( index + 1 ))
-            info "[${index}/${total}] Preparation : ${titre}"
+        if (( total == 0 )); then
+            erreur "La liste de lecture est vide apres chargement."
+            break
+        fi
 
+        local index
+        for index in "${!LDL_URLS[@]}"; do
+            local url="${LDL_URLS[$index]}"
+            local titre="${LDL_TITRES[$index]}"
+            local num=$(( index + 1 ))
+
+            info "[${num}/${total}] Preparation : ${titre}"
+
+            # --- Verification de l accessibilite de la source BTFS -----------
             local tentative=1 source_ok=false
             while (( tentative <= TENTATIVES_RECONNEXION )); do
-                # Tester les 512 premiers octets de l URL HTTP BTFS (pas HEAD car BTFS repond mieux a GET)
-                if "${CURL}" -sf --max-time 20 --range "0-511" -o /dev/null "${url}" 2>/dev/null; then
-                    source_ok=true; break
+                if "${CURL}" -sf --max-time 20 --range "0-511" \
+                        -o /dev/null "${url}" 2>/dev/null; then
+                    source_ok=true
+                    break
                 fi
                 avert "Source inaccessible (tentative ${tentative}/${TENTATIVES_RECONNEXION}) : ${url}"
                 sleep "${DELAI_RECONNEXION}"
@@ -514,24 +560,32 @@ boucle_principale() {
                 continue
             fi
 
+            # --- Diffusion avec tentatives de reconnexion --------------------
             local essai=1 diffusion_ok=false
             while (( essai <= TENTATIVES_RECONNEXION )); do
                 if diffuser_video "${url}" "${titre}"; then
-                    diffusion_ok=true; break
+                    diffusion_ok=true
+                    break
                 fi
                 avert "Erreur diffusion (essai ${essai}/${TENTATIVES_RECONNEXION}). Reprise dans ${DELAI_RECONNEXION}s..."
                 sleep "${DELAI_RECONNEXION}"
                 essai=$(( essai + 1 ))
             done
 
-            [[ "${diffusion_ok}" == "false" ]] && erreur "Echec definitif pour : ${titre}"
-            (( index < total )) && sleep "${DELAI_ENTRE_VIDEOS}"
+            if [[ "${diffusion_ok}" == "false" ]]; then
+                erreur "Echec definitif pour : ${titre}"
+            fi
 
-        done < "${tmp_urls}" 3< "${tmp_titres}"
-        rm -f "${tmp_urls}" "${tmp_titres}"
+            # Pause entre videos (sauf apres la derniere)
+            if (( num < total )); then
+                info "Pause de ${DELAI_ENTRE_VIDEOS}s avant la prochaine video..."
+                sleep "${DELAI_ENTRE_VIDEOS}"
+            fi
+        done
 
         if [[ "${OPT_BOUCLE}" == "true" ]]; then
             tour=$(( tour + 1 ))
+            info "Fin du tour ${tour}. Reprise dans ${DELAI_ENTRE_VIDEOS}s..."
             sleep "${DELAI_ENTRE_VIDEOS}"
         else
             continuer=false
