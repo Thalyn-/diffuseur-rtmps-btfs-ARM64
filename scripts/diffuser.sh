@@ -58,14 +58,12 @@ debug()   { [[ "${NIVEAU_JOURNAL}" == "DEBUG" ]] && _log "DEBUG" "$@" || true; }
 
 # --- Gestion du signal d'arret -----------------------------------------------
 PID_FFMPEG=""
+FIFO_CONCAT=""
 
 nettoyer() {
     info "Signal recu -- arret propre en cours..."
     [[ -n "${PID_FFMPEG}" ]] && kill -SIGTERM "${PID_FFMPEG}" 2>/dev/null && wait "${PID_FFMPEG}" 2>/dev/null || true
-    if [[ -f "${PROJET_DIR}/conf/nginx-rtmp.conf.bak" ]]; then
-        sudo mv "${PROJET_DIR}/conf/nginx-rtmp.conf.bak" "${PROJET_DIR}/conf/nginx-rtmp.conf" 2>/dev/null || true
-        sudo systemctl reload nginx 2>/dev/null || true
-    fi
+    [[ -n "${FIFO_CONCAT}" ]] && rm -f "${FIFO_CONCAT}" 2>/dev/null || true
     info "Diffusion arretee proprement."
     exit 0
 }
@@ -315,19 +313,42 @@ demarrer_stunnel() {
     ok "Stunnel actif sur le port local ${STUNNEL_PORT_LOCAL} -> Kick RTMPS"
 }
 
-# --- Construction des filtres video FFmpeg -----------------------------------
-# Retourne deux variables globales :
-#   FILTRE_MODE  : "vf" si -vf simple suffit, "fc" si -filter_complex requis
-#   FILTRE_VALEUR: la chaine de filtre correspondante
+# =============================================================================
+# ARCHITECTURE FLUX CONTINU (sans coupure entre les videos)
+# =============================================================================
+#
+# Principe : une seule instance FFmpeg tourne en permanence et lit les videos
+# via un PIPE de concatenation (protocol "concat" de FFmpeg ou via une FIFO
+# alimentee par un processus bash).
+#
+# Schema :
+#
+#   [bash: boucle LDL] ──HTTP──> [BTFS gateway :8080]
+#          │                              │
+#          │ ecrit dans FIFO concat       │ flux video brut
+#          ▼                              ▼
+#   /tmp/orbis_concat.fifo  <── ffmpeg -i "concat:..." (demuxer)
+#          │
+#          ▼
+#   FFmpeg unique : decode -> filtre -> encode -> RTMP -> nginx -> DLive/Kick
+#
+# Le flux RTMP n'est JAMAIS coupe entre deux videos. La transition est
+# transparente pour les plateformes et les spectateurs.
+#
+# Pour les URLs HTTP (BTFS), on utilise le filtre "concat" de FFmpeg avec
+# le demuxeur concat via une liste de fichiers de concatenation generee a
+# la volee dans un fichier temporaire remis a jour entre les tours.
+# =============================================================================
+
+# --- Construction du filtre video (variables globales FILTRE_MODE/VALEUR) ----
 construire_filtre_video() {
     local base="scale=w=${LARGEUR_MAX}:h=${HAUTEUR_MAX}:force_original_aspect_ratio=decrease,"
-    base+="pad=${LARGEUR_MAX}:${HAUTEUR_MAX}:(ow-iw)/2:(oh-ih)/2:black"
+    base+="pad=${LARGEUR_MAX}:${HAUTEUR_MAX}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
 
     [[ "${OPT_WEBCAM}" == "true" ]] && WEBCAM_FILTRE_ACTIF=true
 
     if [[ "${OPT_FILIGRANE}" == "true" ]] && [[ -f "${FILIGRANE_IMAGE}" ]]; then
-        # Le filtre movie= ajoute une 2e entree : on doit utiliser -filter_complex
-        # [0:v] = flux video principal   [logo] = image du filigrane
+        # movie= ajoute une 2e entree -> doit utiliser -filter_complex
         FILTRE_MODE="fc"
         FILTRE_VALEUR="[0:v]${base}[scaled];"
         FILTRE_VALEUR+="movie=${FILIGRANE_IMAGE},colorchannelmixer=aa=${FILIGRANE_OPACITE}[logo];"
@@ -338,10 +359,32 @@ construire_filtre_video() {
     fi
 }
 
-# --- Construction et lancement de la commande FFmpeg -------------------------
-diffuser_video() {
-    local url_source="$1"
-    local titre="${2:-inconnu}"
+# --- Generer le fichier de liste de concatenation FFmpeg ---------------------
+# Format attendu par le demuxeur concat de FFmpeg :
+#   ffconcat version 1.0
+#   file 'http://...'
+#   file 'http://...'
+# Les URLs BTFS sont directement supportees via HTTP.
+generer_fichier_concat() {
+    local fichier_out="$1"
+    shift
+    local -a urls=("$@")
+
+    {
+        echo "ffconcat version 1.0"
+        for url in "${urls[@]}"; do
+            echo "file '${url}'"
+            # safe 0 : autoriser les URLs absolues (http://) dans le concat
+            echo "option safe 0"
+        done
+    } > "${fichier_out}"
+}
+
+# --- Lancer FFmpeg en flux continu sur la liste de concat --------------------
+# Un seul processus FFmpeg lit toutes les videos dans l'ordre et encode
+# vers RTMP sans jamais couper le flux.
+diffuser_flux_continu() {
+    local fichier_concat="$1"
     local bitrate_video bitrate_audio
     local url_rtmp_local="rtmp://127.0.0.1:${NGINX_PORT_RTMP}/${NGINX_CHEMIN_APPLICATION}/orbis"
 
@@ -351,34 +394,27 @@ diffuser_video() {
         *)      bitrate_video="${KICK_BITRATE_VIDEO}";  bitrate_audio="${KICK_BITRATE_AUDIO}" ;;
     esac
 
-    # construire_filtre_video() positionne FILTRE_MODE et FILTRE_VALEUR
     FILTRE_MODE="vf"
     FILTRE_VALEUR=""
     construire_filtre_video
 
-    info "----------------------------------------------------"
-    info "Diffusion : ${titre}"
-    info "Source    : ${url_source}"
-    info "Cible     : ${CIBLE_PLATEFORME} | Video : ${bitrate_video}k | Audio : ${bitrate_audio}k"
     info "Encodeur  : ${ENCODEUR_VIDEO} | Filtre : ${FILTRE_MODE}"
-    info "----------------------------------------------------"
+    info "Bitrates  : video=${bitrate_video}k audio=${bitrate_audio}k"
+    info "Cible RTMP: ${url_rtmp_local}"
 
-    # FFmpeg lit directement depuis la passerelle HTTP BTFS.
-    # Note : en BTFS 4.x, /btfs/<HASH> fonctionne sans auth
-    # (seul le chemin racine / retourne 401).
-    #
-    # Options de lecture reseau :
-    #   -probesize 5M / -analyzeduration 5M : analyse rapide du flux entrant
-    #   -fflags +genpts : regenerer les PTS manquants (evite les sauts)
-    #   -re : lire a vitesse reelle (indispensable pour le streaming live)
+    # -safe 0         : autoriser les chemins absolus (URLs http://) dans concat
+    # -protocol_whitelist : autoriser les protocoles utilises (file + http + btfs)
+    # -re             : lire a vitesse reelle (streaming live)
+    # -fflags +genpts : regenerer les PTS manquants entre les videos
     local cmd_ffmpeg=(
         "${FFMPEG}"
-        -hide_banner -loglevel warning
-        -probesize 5M
-        -analyzeduration 5M
-        -fflags +genpts
+        -hide_banner -loglevel warning -stats
+        -f concat
+        -safe 0
+        -protocol_whitelist "file,http,https,tcp,tls,crypto"
         -re
-        -i "${url_source}"
+        -fflags +genpts
+        -i "${fichier_concat}"
     )
 
     if [[ "${WEBCAM_FILTRE_ACTIF}" == "true" ]]; then
@@ -390,9 +426,6 @@ diffuser_video() {
         )
     fi
 
-    # Appliquer le filtre selon le mode :
-    #   "vf" : simple (scale+pad uniquement) -> -vf
-    #   "fc" : complexe (filigrane ou webcam) -> -filter_complex + -map
     if [[ "${FILTRE_MODE}" == "fc" ]]; then
         cmd_ffmpeg+=(-filter_complex "${FILTRE_VALEUR}" -map "[vout]" -map "0:a")
     else
@@ -402,7 +435,6 @@ diffuser_video() {
     cmd_ffmpeg+=(-c:v "${ENCODEUR_VIDEO}")
 
     if [[ "${ENCODEUR_VIDEO}" == "libx264" ]]; then
-        # libx264 : encodage logiciel complet, toutes options supportees
         cmd_ffmpeg+=(
             -preset "${PRESET_ENCODAGE}"
             -profile:v "${PROFIL_H264}" -level:v "${NIVEAU_H264}"
@@ -412,9 +444,6 @@ diffuser_video() {
             -g "${GOP}" -keyint_min "${GOP}" -sc_threshold 0
         )
     elif [[ "${ENCODEUR_VIDEO}" == "h264_v4l2m2m" ]]; then
-        # h264_v4l2m2m : encodeur materiel GPU du Pi4
-        # Ne supporte PAS : preset, profile, level, x264-params, sc_threshold
-        # Supporte : b:v, maxrate, bufsize, g (GOP)
         cmd_ffmpeg+=(
             -b:v "${bitrate_video}k"
             -maxrate "${bitrate_video}k"
@@ -426,27 +455,17 @@ diffuser_video() {
     cmd_ffmpeg+=(
         -r "${DEBIT_IMAGES}"
         -c:a aac -b:a "${bitrate_audio}k" -ar 44100 -ac 2
-        # Reduire la latence cote sortie RTMP :
-        #   -flvflags no_duration_filesize : ne pas ecrire duree/taille (live)
-        #   -flush_packets 1              : vider le buffer reseau apres chaque paquet
         -flvflags no_duration_filesize
         -flush_packets 1
         -f flv "${url_rtmp_local}"
     )
 
-    debug "Commande FFmpeg : ${cmd_ffmpeg[*]}"
+    debug "Commande FFmpeg concat : ${cmd_ffmpeg[*]}"
 
-    # Lancer FFmpeg :
-    # - stderr -> journal ET console (tee) pour voir la progression en direct
-    # - stdout -> /dev/null
-    # La progression (-stats) s affiche sur stderr une ligne mise a jour
-    # toute les secondes (frame= fps= bitrate= time= speed=).
+    # Afficher la progression en temps reel ET dans le journal
     local fifo_log
     fifo_log="$(mktemp -u /tmp/orbis_ffmpeg_XXXXXX.fifo)"
     mkfifo "${fifo_log}"
-
-    # Lecteur du FIFO : ecrit dans le journal ET dans le terminal
-    # Le \r en fin de ligne de -stats est remplace par \n pour le journal
     tee -a "${JOURNAL}" < "${fifo_log}" &
     local pid_tee=$!
 
@@ -457,24 +476,15 @@ diffuser_video() {
     wait "${PID_FFMPEG}" || code_retour=$?
     PID_FFMPEG=""
 
-    # Attendre que tee ait fini d ecrire
     wait "${pid_tee}" 2>/dev/null || true
     rm -f "${fifo_log}"
-
-    # Ligne vide pour separer la progression de la ligne suivante
     echo "" >&2
 
-    if (( code_retour == 0 )); then
-        ok "Video terminee : ${titre}"
-    else
-        avert "FFmpeg code ${code_retour} pour : ${titre}"
-    fi
     return ${code_retour}
 }
 
 # --- Chargement de la liste de lecture ---------------------------------------
 # Remplit les tableaux globaux LDL_URLS[] et LDL_TITRES[]
-# (evite le passage par fichiers temporaires et les problemes de desync)
 lire_liste_lecture() {
     local fichier="$1"
     LDL_URLS=()
@@ -507,90 +517,144 @@ lire_liste_lecture() {
     fi
 }
 
-# --- Boucle principale -------------------------------------------------------
+# --- Verifier l accessibilite de toutes les sources avant de lancer ----------
+verifier_sources() {
+    local -a urls=("$@")
+    local toutes_ok=true
+
+    for url in "${urls[@]}"; do
+        local tentative=1 source_ok=false
+        while (( tentative <= TENTATIVES_RECONNEXION )); do
+            if "${CURL}" -sf --max-time 20 --range "0-511" \
+                    -o /dev/null "${url}" 2>/dev/null; then
+                source_ok=true
+                break
+            fi
+            tentative=$(( tentative + 1 ))
+            sleep 2
+        done
+        if [[ "${source_ok}" == "false" ]]; then
+            avert "Source inaccessible (ignoree) : ${url}"
+            toutes_ok=false
+        else
+            debug "Source OK : ${url}"
+        fi
+    done
+
+    [[ "${toutes_ok}" == "true" ]]
+}
+
+# --- Boucle principale (flux continu, sans coupure entre videos) -------------
 boucle_principale() {
     info "============================================================"
-    info "  Orbis Alternis -- Demarrage de la diffusion"
+    info "  Orbis Alternis -- Demarrage de la diffusion (flux continu)"
     info "  Liste     : $(basename "${LDL_FICHIER}")"
     info "  Plateforme: ${CIBLE_PLATEFORME}"
     info "  Bouclage  : ${OPT_BOUCLE} | Melange : ${OPT_MELANGE}"
     info "============================================================"
 
-    local tour=1 continuer=true
-
     # Tableaux globaux remplis par lire_liste_lecture()
     declare -g -a LDL_URLS=()
     declare -g -a LDL_TITRES=()
 
-    while [[ "${continuer}" == "true" ]]; do
-        info "--- Tour n${tour} de la liste de lecture ---"
+    # Fichier de concatenation temporaire (liste des URLs pour FFmpeg concat)
+    local fichier_concat
+    fichier_concat="$(mktemp /tmp/orbis_concat_XXXXXX.txt)"
+    # Nettoyage garanti a la sortie (en plus du trap global)
+    trap "rm -f '${fichier_concat}'" RETURN
 
-        # Recharger la liste a chaque tour (permet les mises a jour a chaud)
+    local tour=1 continuer=true
+
+    while [[ "${continuer}" == "true" ]]; then
+
+        # --- Charger et valider la liste -------------------------------------
         lire_liste_lecture "${LDL_FICHIER}"
         local total="${#LDL_URLS[@]}"
 
         if (( total == 0 )); then
-            erreur "La liste de lecture est vide apres chargement."
+            erreur "La liste de lecture est vide. Arret."
             break
         fi
 
-        local index
-        for index in "${!LDL_URLS[@]}"; do
-            local url="${LDL_URLS[$index]}"
-            local titre="${LDL_TITRES[$index]}"
-            local num=$(( index + 1 ))
+        info "--- Tour ${tour} : ${total} video(s) en flux continu ---"
 
-            info "[${num}/${total}] Preparation : ${titre}"
+        # Afficher le plan de diffusion
+        local i
+        for i in "${!LDL_URLS[@]}"; do
+            info "  $((i+1))/${total} : ${LDL_TITRES[$i]}"
+        done
 
-            # --- Verification de l accessibilite de la source BTFS -----------
-            local tentative=1 source_ok=false
-            while (( tentative <= TENTATIVES_RECONNEXION )); do
-                if "${CURL}" -sf --max-time 20 --range "0-511" \
-                        -o /dev/null "${url}" 2>/dev/null; then
-                    source_ok=true
-                    break
-                fi
-                avert "Source inaccessible (tentative ${tentative}/${TENTATIVES_RECONNEXION}) : ${url}"
-                sleep "${DELAI_RECONNEXION}"
-                tentative=$(( tentative + 1 ))
-            done
-
-            if [[ "${source_ok}" == "false" ]]; then
-                erreur "Source inaccessible apres ${TENTATIVES_RECONNEXION} tentatives. Passage a la suivante."
-                continue
-            fi
-
-            # --- Diffusion avec tentatives de reconnexion --------------------
-            local essai=1 diffusion_ok=false
-            while (( essai <= TENTATIVES_RECONNEXION )); do
-                if diffuser_video "${url}" "${titre}"; then
-                    diffusion_ok=true
-                    break
-                fi
-                avert "Erreur diffusion (essai ${essai}/${TENTATIVES_RECONNEXION}). Reprise dans ${DELAI_RECONNEXION}s..."
-                sleep "${DELAI_RECONNEXION}"
-                essai=$(( essai + 1 ))
-            done
-
-            if [[ "${diffusion_ok}" == "false" ]]; then
-                erreur "Echec definitif pour : ${titre}"
-            fi
-
-            # Pause entre videos (sauf apres la derniere)
-            if (( num < total )); then
-                info "Pause de ${DELAI_ENTRE_VIDEOS}s avant la prochaine video..."
-                sleep "${DELAI_ENTRE_VIDEOS}"
+        # --- Verifier les sources (en parallele, rapide) --------------------
+        info "Verification des sources BTFS..."
+        local -a urls_valides=() titres_valides=()
+        for i in "${!LDL_URLS[@]}"; do
+            local url="${LDL_URLS[$i]}"
+            local code
+            code=$("${CURL}" -sf --max-time 15 --range "0-511" \
+                -o /dev/null -w "%{http_code}" "${url}" 2>/dev/null || echo "000")
+            if [[ "${code}" =~ ^2 ]]; then
+                urls_valides+=("${url}")
+                titres_valides+=("${LDL_TITRES[$i]}")
+                debug "  OK (HTTP ${code}) : ${LDL_TITRES[$i]}"
+            else
+                avert "  IGNOREE (HTTP ${code}) : ${LDL_TITRES[$i]} -- ${url}"
             fi
         done
 
+        if (( ${#urls_valides[@]} == 0 )); then
+            erreur "Aucune source valide dans ce tour. Attente ${DELAI_RECONNEXION}s..."
+            sleep "${DELAI_RECONNEXION}"
+            if [[ "${OPT_BOUCLE}" == "true" ]]; then
+                tour=$(( tour + 1 ))
+                continue
+            else
+                break
+            fi
+        fi
+
+        # --- Generer le fichier concat pour FFmpeg ---------------------------
+        generer_fichier_concat "${fichier_concat}" "${urls_valides[@]}"
+        debug "Fichier concat : $(cat "${fichier_concat}")"
+
+        # --- Lancer FFmpeg en flux continu -----------------------------------
+        info "----------------------------------------------------"
+        info "Lancement du flux continu (${#urls_valides[@]} video(s))"
+        info "----------------------------------------------------"
+
+        local essai=1 diffusion_ok=false
+        while (( essai <= TENTATIVES_RECONNEXION )); do
+            if diffuser_flux_continu "${fichier_concat}"; then
+                diffusion_ok=true
+                break
+            fi
+            local code_ffmpeg=$?
+            avert "Flux interrompu (essai ${essai}/${TENTATIVES_RECONNEXION}, code ${code_ffmpeg})"
+            if (( essai < TENTATIVES_RECONNEXION )); then
+                avert "Reprise dans ${DELAI_RECONNEXION}s..."
+                sleep "${DELAI_RECONNEXION}"
+                # Regenerer le fichier concat (les URLs BTFS sont stables)
+                generer_fichier_concat "${fichier_concat}" "${urls_valides[@]}"
+            fi
+            essai=$(( essai + 1 ))
+        done
+
+        if [[ "${diffusion_ok}" == "false" ]]; then
+            erreur "Echec definitif du flux apres ${TENTATIVES_RECONNEXION} tentatives."
+        else
+            ok "Tour ${tour} termine (${#urls_valides[@]} video(s) diffusees en flux continu)."
+        fi
+
+        # --- Gestion du bouclage ---------------------------------------------
         if [[ "${OPT_BOUCLE}" == "true" ]]; then
             tour=$(( tour + 1 ))
-            info "Fin du tour ${tour}. Reprise dans ${DELAI_ENTRE_VIDEOS}s..."
+            info "Reprise du tour ${tour} dans ${DELAI_ENTRE_VIDEOS}s..."
             sleep "${DELAI_ENTRE_VIDEOS}"
         else
             continuer=false
         fi
     done
+
+    rm -f "${fichier_concat}" 2>/dev/null || true
     info "Diffusion terminee."
 }
 
