@@ -173,3 +173,38 @@ Vérifier la disponibilité de la webcam :
 v4l2-ctl --list-devices
 ls /dev/video*
 ```
+
+## 🚀 Status du projet
+
+| Composant | Status | Notes |
+|-----------|--------|-------|
+| **BTFS** | ✅ OK | Passerelle 8080 accessible |
+| **nginx-RTMP** | ✅ OK | Port 9935 fonctionnel |
+| **Stunnel-RTMPS** | ✅ OK | Port 11935 pour Kick |
+| **FFmpeg encode** | ✅ OK | À optimiser pour Pi4 |
+| **DLive intégration** | ✅ OK | Flux reçu et affiché |
+| **Kick intégration** | ✅ OK | Flux reçu et affiché |
+| **Transitions vidéo** | 🔄 À tester | Après optimisations |
+| **Latence** | ⚠️ À améliorer | Config Pi4 à appliquer |
+
+---
+
+## 💡 Bonus : Monitoring en temps réel
+
+Si tu veux monitorer la qualité du flux pendant la diffusion :
+
+```bash
+# Terminal 1 : Diffusion
+./scripts/diffuser.sh -l ldl/ldl_tot.txt -p dlive -n
+
+# Terminal 2 : Monitoring CPU
+watch -n 1 'ps aux | grep ffmpeg | grep -v grep | awk "{print \$3, \$4}"'
+
+# Terminal 3 : Monitoring réseau
+watch -n 1 'ss -tanu | grep 9935'
+
+# Terminal 4 : Voir les logs RTMP
+tail -f journaux/diffusion_*.log
+```
+
+---
