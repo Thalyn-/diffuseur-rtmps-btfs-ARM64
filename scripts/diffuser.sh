@@ -248,7 +248,7 @@ generer_config_nginx() {
 
     # --- 3. Generer le bloc rtmp {} avec les vraies valeurs ----------------
     {
-        echo "# Genere par Orbis Alternis le $(date +\"%Y-%m-%d %H:%M:%S\")"
+        echo "# Genere par Orbis Alternis le $(date +'%Y-%m-%d %H:%M:%S')"
         echo "rtmp {"
         echo "    server {"
         echo "        listen ${NGINX_PORT_RTMP};"
@@ -316,16 +316,26 @@ demarrer_stunnel() {
 }
 
 # --- Construction des filtres video FFmpeg -----------------------------------
+# Retourne deux variables globales :
+#   FILTRE_MODE  : "vf" si -vf simple suffit, "fc" si -filter_complex requis
+#   FILTRE_VALEUR: la chaine de filtre correspondante
 construire_filtre_video() {
-    local vf="scale=w=${LARGEUR_MAX}:h=${HAUTEUR_MAX}:force_original_aspect_ratio=decrease,"
-    vf+="pad=${LARGEUR_MAX}:${HAUTEUR_MAX}:(ow-iw)/2:(oh-ih)/2:black"
+    local base="scale=w=${LARGEUR_MAX}:h=${HAUTEUR_MAX}:force_original_aspect_ratio=decrease,"
+    base+="pad=${LARGEUR_MAX}:${HAUTEUR_MAX}:(ow-iw)/2:(oh-ih)/2:black"
+
+    [[ "${OPT_WEBCAM}" == "true" ]] && WEBCAM_FILTRE_ACTIF=true
 
     if [[ "${OPT_FILIGRANE}" == "true" ]] && [[ -f "${FILIGRANE_IMAGE}" ]]; then
-        vf+=",movie=${FILIGRANE_IMAGE},colorchannelmixer=aa=${FILIGRANE_OPACITE}[logo]"
-        vf+=";[in][logo]overlay=${FILIGRANE_POSITION}[out]"
+        # Le filtre movie= ajoute une 2e entree : on doit utiliser -filter_complex
+        # [0:v] = flux video principal   [logo] = image du filigrane
+        FILTRE_MODE="fc"
+        FILTRE_VALEUR="[0:v]${base}[scaled];"
+        FILTRE_VALEUR+="movie=${FILIGRANE_IMAGE},colorchannelmixer=aa=${FILIGRANE_OPACITE}[logo];"
+        FILTRE_VALEUR+="[scaled][logo]overlay=${FILIGRANE_POSITION}[vout]"
+    else
+        FILTRE_MODE="vf"
+        FILTRE_VALEUR="${base}"
     fi
-    [[ "${OPT_WEBCAM}" == "true" ]] && WEBCAM_FILTRE_ACTIF=true
-    echo "${vf}"
 }
 
 # --- Construction et lancement de la commande FFmpeg -------------------------
@@ -341,13 +351,16 @@ diffuser_video() {
         *)      bitrate_video="${KICK_BITRATE_VIDEO}";  bitrate_audio="${KICK_BITRATE_AUDIO}" ;;
     esac
 
-    local filtre_video
-    filtre_video="$(construire_filtre_video)"
+    # construire_filtre_video() positionne FILTRE_MODE et FILTRE_VALEUR
+    FILTRE_MODE="vf"
+    FILTRE_VALEUR=""
+    construire_filtre_video
 
     info "----------------------------------------------------"
     info "Diffusion : ${titre}"
     info "Source    : ${url_source}"
     info "Cible     : ${CIBLE_PLATEFORME} | Video : ${bitrate_video}k | Audio : ${bitrate_audio}k"
+    info "Encodeur  : ${ENCODEUR_VIDEO} | Filtre : ${FILTRE_MODE}"
     info "----------------------------------------------------"
 
     # FFmpeg lit directement depuis la passerelle HTTP BTFS.
@@ -369,26 +382,41 @@ diffuser_video() {
         )
     fi
 
-    cmd_ffmpeg+=(-vf "${filtre_video}" -c:v "${ENCODEUR_VIDEO}")
+    # Appliquer le filtre selon le mode :
+    #   "vf" : simple (scale+pad uniquement) -> -vf
+    #   "fc" : complexe (filigrane ou webcam) -> -filter_complex + -map
+    if [[ "${FILTRE_MODE}" == "fc" ]]; then
+        cmd_ffmpeg+=(-filter_complex "${FILTRE_VALEUR}" -map "[vout]" -map "0:a")
+    else
+        cmd_ffmpeg+=(-vf "${FILTRE_VALEUR}")
+    fi
+
+    cmd_ffmpeg+=(-c:v "${ENCODEUR_VIDEO}")
 
     if [[ "${ENCODEUR_VIDEO}" == "libx264" ]]; then
+        # libx264 : encodage logiciel complet, toutes options supportees
         cmd_ffmpeg+=(
             -preset "${PRESET_ENCODAGE}"
             -profile:v "${PROFIL_H264}" -level:v "${NIVEAU_H264}"
             -b:v "${bitrate_video}k" -maxrate "${bitrate_video}k"
             -bufsize "$((bitrate_video * 2))k"
             -x264-params "nal-hrd=cbr:force-cfr=1"
+            -g "${GOP}" -keyint_min "${GOP}" -sc_threshold 0
         )
     elif [[ "${ENCODEUR_VIDEO}" == "h264_v4l2m2m" ]]; then
+        # h264_v4l2m2m : encodeur materiel GPU du Pi4
+        # Ne supporte PAS : preset, profile, level, x264-params, sc_threshold
+        # Supporte : b:v, maxrate, bufsize, g (GOP)
         cmd_ffmpeg+=(
-            -b:v "${bitrate_video}k" -maxrate "${bitrate_video}k"
+            -b:v "${bitrate_video}k"
+            -maxrate "${bitrate_video}k"
             -bufsize "$((bitrate_video * 2))k"
-            -num_capture_buffers 64
+            -g "${GOP}"
         )
     fi
 
     cmd_ffmpeg+=(
-        -g "${GOP}" -keyint_min "${GOP}" -sc_threshold 0 -r "${DEBIT_IMAGES}"
+        -r "${DEBIT_IMAGES}"
         -c:a aac -b:a "${bitrate_audio}k" -ar 44100 -ac 2
         -f flv "${url_rtmp_local}"
     )
