@@ -1,6 +1,7 @@
 $files = @(
     "scripts\diffuser.sh",
     "scripts\verifier-systeme.sh",
+    "conf\orbis.conf",
     "docs\GUIDE-RAPIDE-RTMP.md",
     "docs\NOUVELLES-OUTILS-DIAGNOSTIC.md",
     "docs\RESOLUTION-RTMP.md",

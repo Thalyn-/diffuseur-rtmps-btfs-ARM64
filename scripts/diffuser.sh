@@ -355,9 +355,10 @@ construire_filtre_video() {
 # Format attendu par le demuxeur concat de FFmpeg :
 #   ffconcat version 1.0
 #   file 'http://...'
-#   option safe 0
 #   file 'http://...'
-#   option safe 0
+#
+# NOTE : "option safe 0" n'est PAS une directive valide du demuxeur concat.
+# L'autorisation des URLs absolues se fait via -safe 0 en argument FFmpeg.
 generer_fichier_concat() {
     local fichier_out="$1"
     shift
@@ -367,7 +368,6 @@ generer_fichier_concat() {
         echo "ffconcat version 1.0"
         for url in "$@"; do
             echo "file '${url}'"
-            echo "option safe 0"
         done
     } > "${fichier_out}"
 }
@@ -375,6 +375,16 @@ generer_fichier_concat() {
 # --- Lancer FFmpeg en flux continu sur la liste de concat --------------------
 # Un seul processus FFmpeg lit toutes les videos dans l'ordre et encode
 # vers RTMP sans jamais couper le flux.
+#
+# Notes importantes pour le Pi 4 avec h264_v4l2m2m :
+#  - Le filtrage logiciel (scale/pad/overlay) tourne sur CPU avant l'encodeur
+#    materiel. A 1080p + filigrane, le Pi 4 ne tient pas speed=1x.
+#  - Solution : travailler en 720p (LARGEUR_MAX=1280 HAUTEUR_MAX=720 dans conf).
+#  - -probesize / -analyzeduration reduits : evite la longue analyse initiale
+#    des flux HTTP BTFS avant de demarrer l'encodage.
+#  - -avioflags direct : desactive le cache de lecture pour les URLs HTTP,
+#    reduit la latence de demarrage de chaque segment concat.
+#  - -vsync cfr : force un debit d'images constant pour la sortie RTMP.
 diffuser_flux_continu() {
     local fichier_concat="$1"
     local bitrate_video
@@ -397,19 +407,29 @@ diffuser_flux_continu() {
     construire_filtre_video
 
     info "Encodeur  : ${ENCODEUR_VIDEO} | Filtre : ${FILTRE_MODE}"
+    info "Resolution: ${LARGEUR_MAX}x${HAUTEUR_MAX}"
     info "Bitrates  : video=${bitrate_video}k audio=${bitrate_audio}k"
     info "Cible RTMP: ${url_rtmp_local}"
 
     # Construction du tableau de commande FFmpeg
+    # -probesize 5M / -analyzeduration 5M : analyse rapide des flux HTTP (defaut 5s trop long)
+    # -safe 0                             : autorise les URLs absolues dans le fichier concat
+    # -protocol_whitelist                 : protocoles autorises pour le demuxeur concat
+    # -re                                 : lecture a vitesse reelle (streaming live)
+    # -fflags +genpts+igndts              : regenere PTS/DTS manquants ou incoherents entre videos
+    # -avioflags direct                   : pas de cache lecture HTTP (transitions plus rapides)
     local -a cmd_ffmpeg
     cmd_ffmpeg=(
         "${FFMPEG}"
         -hide_banner -loglevel warning -stats
+        -probesize 5M
+        -analyzeduration 5M
         -f concat
         -safe 0
         -protocol_whitelist "file,http,https,tcp,tls,crypto"
+        -avioflags direct
         -re
-        -fflags +genpts
+        -fflags +genpts+igndts
         -i "${fichier_concat}"
     )
 
@@ -442,13 +462,19 @@ diffuser_flux_continu() {
             -g "${GOP}"
             -keyint_min "${GOP}"
             -sc_threshold 0
+            -vsync cfr
         )
     elif [[ "${ENCODEUR_VIDEO}" == "h264_v4l2m2m" ]]; then
+        # h264_v4l2m2m : encodeur materiel Pi4, options restreintes
+        # Pas de preset/profile/x264-params : non supporte par ce codec
+        # -num_capture_buffers 32 : augmente les buffers V4L2 pour eviter les drops
         cmd_ffmpeg+=(
             -b:v "${bitrate_video}k"
             -maxrate "${bitrate_video}k"
             -bufsize "$((bitrate_video * 2))k"
             -g "${GOP}"
+            -num_capture_buffers 32
+            -vsync cfr
         )
     fi
 
