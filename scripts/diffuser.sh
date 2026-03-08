@@ -563,7 +563,9 @@ boucle_principale() {
     # Nettoyage garanti a la sortie (en plus du trap global)
     trap "rm -f '${fichier_concat}'" RETURN
 
-    local tour=1 continuer=true
+    local tour continuer total i
+    tour=1
+    continuer=true
 
     while [[ "${continuer}" == "true" ]]; then
 
@@ -586,7 +588,9 @@ boucle_principale() {
 
         # --- Verifier les sources (en parallele, rapide) --------------------
         info "Verification des sources BTFS..."
-        local -a urls_valides=() titres_valides=()
+        local -a urls_valides titres_valides
+        urls_valides=()
+        titres_valides=()
         for i in "${!LDL_URLS[@]}"; do
             local url="${LDL_URLS[$i]}"
             local code
@@ -621,13 +625,16 @@ boucle_principale() {
         info "Lancement du flux continu (${#urls_valides[@]} video(s))"
         info "----------------------------------------------------"
 
-        local essai=1 diffusion_ok=false
+        local essai diffusion_ok code_ffmpeg
+        essai=1
+        diffusion_ok=false
+        code_ffmpeg=0
         while (( essai <= TENTATIVES_RECONNEXION )); do
             if diffuser_flux_continu "${fichier_concat}"; then
                 diffusion_ok=true
                 break
             fi
-            local code_ffmpeg=$?
+            code_ffmpeg=$?
             avert "Flux interrompu (essai ${essai}/${TENTATIVES_RECONNEXION}, code ${code_ffmpeg})"
             if (( essai < TENTATIVES_RECONNEXION )); then
                 avert "Reprise dans ${DELAI_RECONNEXION}s..."
