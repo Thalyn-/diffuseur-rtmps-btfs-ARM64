@@ -1,1 +1,675 @@
-﻿#!/usr/bin/env bash\n# =============================================================================\n# diffuser.sh -- Script principal de diffusion Orbis Alternis\n# =============================================================================\n# Usage : ./diffuser.sh [OPTIONS]\n#\n#   -l <fichier>    Liste de lecture (defaut : ldl/ldl_tot.txt)\n#   -p <cible>      Plateforme : dlive | kick | toutes (defaut : toutes)\n#   -m              Melanger aleatoirement la liste\n#   -b              Forcer le bouclage\n#   -n              Forcer lecture unique sans boucle\n#   -f              Activer le filigrane (logo)\n#   -w              Activer la surcouche webcam\n#   -h              Afficher l'aide\n#\n# Exemples :\n#   ./diffuser.sh\n#   ./diffuser.sh -l ldl/ldl_dystopies.txt -p kick -m\n#   ./diffuser.sh -l ldl/ldl_tot.txt -p toutes -f\n# =============================================================================\n\n# --- Encodage et locale (evite les problemes d'affichage UTF-8 en SSH) -------\nexport LANG=C.UTF-8\nexport LC_ALL=C.UTF-8\n\nset -euo pipefail\nIFS=$'\n\t'\n\n# --- Chemin absolu du projet -------------------------------------------------\nSCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\nPROJET_DIR="$(dirname "${SCRIPT_DIR}")"\n\n# --- Chargement de la configuration ------------------------------------------\nFICHIER_CONF="${PROJET_DIR}/conf/orbis.conf"\nif [[ ! -f "${FICHIER_CONF}" ]]; then\n    echo "[ERREUR] Fichier de configuration introuvable : ${FICHIER_CONF}" >&2\n    exit 1\nfi\n# shellcheck source=../conf/orbis.conf\nsource "${FICHIER_CONF}"\n\n# --- Journalisation ----------------------------------------------------------\nmkdir -p "${REPERTOIRE_JOURNAUX}"\nJOURNAL="${REPERTOIRE_JOURNAUX}/diffusion_$(date +%Y%m%d_%H%M%S).log"\n\n_log() {\n    local niveau="$1"; shift\n    local message="$*"\n    local horodatage\n    horodatage="$(date +'%Y-%m-%d %H:%M:%S')"\n    printf "[%s] [%-6s] %s\n" "${horodatage}" "${niveau}" "${message}" | tee -a "${JOURNAL}"\n}\ninfo()    { _log "INFO"   "$@"; }\nok()      { _log "OK"     "$@"; }\navert()   { _log "AVERT"  "$@"; }\nerreur()  { _log "ERREUR" "$@"; }\ndebug()   { [[ "${NIVEAU_JOURNAL}" == "DEBUG" ]] && _log "DEBUG" "$@" || true; }\n\n# --- Gestion du signal d'arret -----------------------------------------------\nPID_FFMPEG=""\nFIFO_CONCAT=""\n\nnettoyer() {\n    info "Signal recu -- arret propre en cours..."\n    [[ -n "${PID_FFMPEG}" ]] && kill -SIGTERM "${PID_FFMPEG}" 2>/dev/null && wait "${PID_FFMPEG}" 2>/dev/null || true\n    [[ -n "${FIFO_CONCAT}" ]] && rm -f "${FIFO_CONCAT}" 2>/dev/null || true\n    info "Diffusion arretee proprement."\n    exit 0\n}\ntrap nettoyer SIGINT SIGTERM\n\n# --- Valeurs par defaut ------------------------------------------------------\nLDL_FICHIER="${REPERTOIRE_LDL}/ldl_tot.txt"\nCIBLE_PLATEFORME="toutes"\nOPT_MELANGE=false\nOPT_BOUCLE="${BOUCLE}"\nOPT_FILIGRANE="${FILIGRANE_ACTIF}"\nOPT_WEBCAM="${WEBCAM_ACTIF}"\nWEBCAM_FILTRE_ACTIF=false\n\n# --- Analyse des arguments ---------------------------------------------------\nusage() {\n    grep '^#' "${BASH_SOURCE[0]}" | grep -A50 'Usage' | sed 's/^# \?//'\n    exit 0\n}\n\nwhile getopts ":l:p:mbnfwh" opt; do\n    case "${opt}" in\n        l) LDL_FICHIER="${OPTARG}" ;;\n        p) CIBLE_PLATEFORME="${OPTARG}" ;;\n        m) OPT_MELANGE=true ;;\n        b) OPT_BOUCLE=true ;;\n        n) OPT_BOUCLE=false ;;\n        f) OPT_FILIGRANE=true ;;\n        w) OPT_WEBCAM=true ;;\n        h) usage ;;\n        :) erreur "Option -${OPTARG} requiert un argument."; exit 1 ;;\n        \?) erreur "Option inconnue : -${OPTARG}"; exit 1 ;;\n    esac\ndone\n\n# --- Validation des prerequis ------------------------------------------------\nverifier_dependances() {\n    local manquants=()\n    for outil in "${FFMPEG}" "${FFPROBE}" "${CURL}" "${STUNNEL}"; do\n        [[ ! -x "${outil}" ]] && manquants+=("")\n    done\n    if ! command -v nginx &>/dev/null; then\n        manquants+=("nginx")\n    fi\n    if (( ${#manquants[@]} > 0 )); then\n        erreur "Outils manquants : ${manquants[*]}"\n        erreur "Consultez docs/INSTALLATION.md pour les installer."\n        exit 1\n    fi\n    ok "Toutes les dependances sont presentes."\n}\n\nverifier_cles_flux() {\n    local ok_flux=true\n    if [[ "${CIBLE_PLATEFORME}" =~ ^(dlive|toutes)$ ]] && [[ -z "${DLIVE_CLE_FLUX}" ]]; then\n        erreur "Cle de flux DLive manquante (DLIVE_CLE_FLUX dans orbis.conf)"\n        ok_flux=false\n    fi\n    if [[ "${CIBLE_PLATEFORME}" =~ ^(kick|toutes)$ ]] && [[ -z "${KICK_CLE_FLUX}" ]]; then\n        erreur "Cle de flux Kick manquante (KICK_CLE_FLUX dans orbis.conf)"\n        ok_flux=false\n    fi\n    [[ "${ok_flux}" == "false" ]] && exit 1\n    ok "Cles de flux verifiees."\n}\n\nverifier_ldl() {\n    if [[ ! -f "${LDL_FICHIER}" ]]; then\n        erreur "Liste de lecture introuvable : ${LDL_FICHIER}"\n        exit 1\n    fi\n    local nb_entrees\n    nb_entrees=$(grep -cE '^https?://' "${LDL_FICHIER}" 2>/dev/null || echo 0)\n    if (( nb_entrees == 0 )); then\n        erreur "La liste de lecture est vide ou ne contient pas d'URL valides."\n        exit 1\n    fi\n    ok "Liste de lecture chargee : ${LDL_FICHIER} (${nb_entrees} entrees)"\n}\n\n# =============================================================================\n# verifier_btfs : verifie le daemon BTFS (API port 5001) ET la passerelle\n#                 HTTP fichiers (port 8080) -- deux services distincts !\n#\n# Architecture BTFS :\n#   API   http://127.0.0.1:5001/api/v1/...  -> controle du daemon\n#   GW    http://127.0.0.1:8080/btfs/<HASH> -> acces aux fichiers\n# =============================================================================\nverifier_btfs() {\n    info "Verification du daemon BTFS..."\n\n    # Etape 1 : daemon actif ? (via CLI locale, sans HTTP)\n    if ! command -v btfs &>/dev/null; then\n        erreur "Commande btfs introuvable. Consultez docs/BTFS.md"\n        exit 1\n    fi\n    if ! btfs version &>/dev/null 2>&1; then\n        avert "Daemon BTFS inactif. Tentative de demarrage..."\n        eval "${BTFS_DAEMON_CMD}" &>/dev/null &\n        sleep "${BTFS_DELAI_DEMARRAGE}"\n        if ! btfs version &>/dev/null 2>&1; then\n            erreur "Impossible de demarrer le daemon BTFS."\n            erreur "Lancez manuellement : ${BTFS_DAEMON_CMD}"\n            exit 1\n        fi\n    fi\n    local version_btfs\n    version_btfs=$(btfs version 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+-?[a-zA-Z0-9]*" | head -1 || echo "?")\n    ok "Daemon BTFS actif (v${version_btfs})"\n\n    # Etape 2 : passerelle HTTP fichiers accessible ?\n    # IMPORTANT : en BTFS 4.x, / retourne 401 mais /btfs/<HASH> fonctionne.\n    # On teste donc directement avec un hash reel (les 512 premiers octets).\n    info "Test passerelle HTTP BTFS sur ${BTFS_PASSERELLE}..."\n    local url_test="${BTFS_PASSERELLE}/${BTFS_HASH_TEST}"\n    local code_http\n    code_http=$("${CURL}" -sf --max-time 20 --range "0-511" \\n                -o /dev/null -w "%{http_code}" "${url_test}" 2>/dev/null || echo "000")\n    case "${code_http}" in\n        200|206) ok "Passerelle HTTP BTFS accessible : ${BTFS_PASSERELLE} (HTTP ${code_http})" ;;\n        000)     erreur "Passerelle HTTP BTFS muette sur le port ${BTFS_PORT_PASSERELLE}"\n                 erreur "  ss -tlnp | grep ${BTFS_PORT_PASSERELLE}"\n                 exit 1 ;;\n        401)     erreur "Passerelle HTTP BTFS retourne 401 meme sur les fichiers."\n                 erreur "  Verifiez la config BTFS : btfs config Addresses.Gateway"\n                 exit 1 ;;\n        *)       avert "Passerelle HTTP BTFS : code inattendu ${code_http} (on continue)" ;;\n    esac\n}\n\n# --- Configuration dynamique de nginx-rtmp -----------------------------------\ngenerer_config_nginx() {\n    info "Configuration nginx (module RTMP)..."\n    local nginx_conf="/etc/nginx/nginx.conf"\n    local rtmp_bloc="/etc/nginx/orbis-rtmp-block.conf"\n    local stats_conf="/etc/nginx/sites-enabled/orbis-stats.conf"\n\n    # --- 1. Nettoyer les fichiers mal places de sessions precedentes -------\n    for f_ancien in "/etc/nginx/sites-enabled/orbis-rtmp.conf" \\n                   "/etc/nginx/sites-enabled/orbis-rtmp"; do\n        [[ -f "${f_ancien}" ]] && sudo rm -f "${f_ancien}" && \\n            info "Ancien fichier supprime : ${f_ancien}"\n    done\n\n    # --- 2. Gestion du module RTMP -----------------------------------------\n    # Sur Raspberry Pi OS, libnginx-mod-rtmp installe automatiquement\n    # /etc/nginx/modules-enabled/50-mod-rtmp.conf (charge via include deja present).\n    # load_module dans nginx.conf est une alternative mais DOIT etre en ligne 1.\n    # On retire toute tentative precedente ratee (load_module mal positionne).\n    if sudo grep -q "load_module.*ngx_rtmp" "${nginx_conf}" 2>/dev/null; then\n        # Verifier si c est bien la ligne 1\n        local ligne1\n        ligne1=$(sudo head -1 "${nginx_conf}")\n        if [[ "${ligne1}" =~ load_module.*ngx_rtmp ]]; then\n            ok "Module RTMP : load_module deja en ligne 1 de ${nginx_conf}"\n        else\n            # Mal positionne (ex: ligne 7 apres user/worker) -> supprimer\n            info "Suppression load_module mal positionne dans ${nginx_conf}..."\n            sudo sed -i "/.*load_module.*ngx_rtmp_module.*/d" "${nginx_conf}"\n            info "load_module supprime (le module sera charge via modules-enabled/)"\n        fi\n    fi\n\n    # Verifier que le module est bien charge (via modules-enabled/ ou ligne 1)\n    local module_ok=false\n    if [[ -f /etc/nginx/modules-enabled/50-mod-rtmp.conf ]] || \\n       [[ -f /usr/lib/nginx/modules/ngx_rtmp_module.so && \\n          -n "$(ls /etc/nginx/modules-enabled/ 2>/dev/null | grep rtmp)" ]]; then\n        ok "Module RTMP charge via /etc/nginx/modules-enabled/ (libnginx-mod-rtmp)"\n        module_ok=true\n    fi\n\n    if [[ "${module_ok}" == "false" ]]; then\n        # Dernier recours : inserer en toute premiere ligne\n        if ! sudo grep -q "^load_module.*ngx_rtmp" "${nginx_conf}"; then\n            sudo sed -i "1s|^|load_module modules/ngx_rtmp_module.so;\n|" "${nginx_conf}"\n            ok "Module RTMP ajoute en ligne 1 de ${nginx_conf}"\n        fi\n    fi\n\n    # --- 3. Generer le bloc rtmp {} avec les vraies valeurs ----------------\n    {\n        echo "# Genere par Orbis Alternis le $(date +'%Y-%m-%d %H:%M:%S')"\n        echo "rtmp {"\n        echo "    server {"\n        echo "        listen ${NGINX_PORT_RTMP};"\n        echo "        chunk_size 4096;"\n        echo "        max_message 1M;"\n        echo ""\n        echo "        application ${NGINX_CHEMIN_APPLICATION} {"\n        echo "            live on;"\n        echo "            record off;"\n        echo "            allow publish 127.0.0.1;"\n        echo "            deny publish all;"\n        echo "            allow play all;"\n        [[ "${DLIVE_ACTIF}" == "true" ]] && \\n            echo "            push ${DLIVE_SERVEUR}/${DLIVE_CLE_FLUX};"\n        [[ "${KICK_ACTIF}"  == "true" ]] && \\n            echo "            push rtmp://127.0.0.1:${STUNNEL_PORT_LOCAL}/app/${KICK_CLE_FLUX};"\n        echo "        }"\n        echo "    }"\n        echo "}"\n    } | sudo tee "${rtmp_bloc}" > /dev/null\n    ok "Bloc RTMP genere : ${rtmp_bloc}"\n\n    # --- 4. Inclure le bloc rtmp en fin de nginx.conf (niveau racine) ------\n    if ! sudo grep -q "orbis-rtmp-block.conf" "${nginx_conf}" 2>/dev/null; then\n        printf "\n# Orbis Alternis -- bloc RTMP\ninclude %s;\n" "${rtmp_bloc}" \\n            | sudo tee -a "${nginx_conf}" > /dev/null\n        ok "Include rtmp ajoute dans ${nginx_conf}"\n    else\n        ok "Include rtmp deja present dans ${nginx_conf}"\n    fi\n\n    # --- 5. Serveur HTTP stats (server{} valide dans http{} -> sites-enabled)\n    {\n        echo "server {"\n        echo "    listen 8088;"\n        echo "    server_name localhost;"\n        echo "    location /stat { rtmp_stat all; rtmp_stat_stylesheet stat.xsl; }"\n        echo "    location /controle { rtmp_control all; }"\n        echo "}"\n    } | sudo tee "${stats_conf}" > /dev/null\n    ok "Stats HTTP nginx-rtmp : port 8088"\n\n    # --- 6. Validation et rechargement ------------------------------------\n    if ! sudo nginx -t 2>>"${JOURNAL}"; then\n        erreur "Configuration nginx invalide."\n        erreur "Diagnostic complet : sudo nginx -T 2>&1 | head -50"\n        exit 1\n    fi\n    sudo systemctl reload nginx\n    ok "nginx recharge avec la configuration RTMP."\n}\n\n# --- Demarrage de Stunnel ----------------------------------------------------\ndemarrer_stunnel() {\n    if [[ "${KICK_ACTIF}" != "true" ]]; then return 0; fi\n    info "Demarrage de Stunnel (tunnel RTMPS Kick)..."\n    sudo cp "${PROJET_DIR}/conf/stunnel-kick.conf" /etc/stunnel/stunnel.conf\n    sudo systemctl restart stunnel4\n    sleep 2\n    if ! systemctl is-active --quiet stunnel4; then\n        erreur "Stunnel n'a pas pu demarrer. Voir /var/log/stunnel4/stunnel.log"\n        exit 1\n    fi\n    ok "Stunnel actif sur le port local ${STUNNEL_PORT_LOCAL} -> Kick RTMPS"\n}\n\n# =============================================================================\n# ARCHITECTURE FLUX CONTINU (sans coupure entre les videos)\n# =============================================================================\n#\n# Principe : une seule instance FFmpeg tourne en permanence et lit les videos\n# via un PIPE de concatenation (protocol "concat" de FFmpeg ou via une FIFO\n# alimentee par un processus bash).\n#\n# Schema :\n#\n#   [bash: boucle LDL] â”€â”€HTTPâ”€â”€> [BTFS gateway :8080]\n#          â”‚                              â”‚\n#          â”‚ ecrit dans FIFO concat       â”‚ flux video brut\n#          â–¼                              â–¼\n#   /tmp/orbis_concat.fifo  <â”€â”€ ffmpeg -i "concat:..." (demuxer)\n#          â”‚\n#          â–¼\n#   FFmpeg unique : decode -> filtre -> encode -> RTMP -> nginx -> DLive/Kick\n#\n# Le flux RTMP n'est JAMAIS coupe entre deux videos. La transition est\n# transparente pour les plateformes et les spectateurs.\n#\n# Pour les URLs HTTP (BTFS), on utilise le filtre "concat" de FFmpeg avec\n# le demuxeur concat via une liste de fichiers de concatenation generee a\n# la volee dans un fichier temporaire remis a jour entre les tours.\n# =============================================================================\n\n# --- Construction du filtre video (variables globales FILTRE_MODE/VALEUR) ----\nconstruire_filtre_video() {\n    local base="scale=w=${LARGEUR_MAX}:h=${HAUTEUR_MAX}:force_original_aspect_ratio=decrease,"\n    base+="pad=${LARGEUR_MAX}:${HAUTEUR_MAX}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"\n\n    [[ "${OPT_WEBCAM}" == "true" ]] && WEBCAM_FILTRE_ACTIF=true\n\n    if [[ "${OPT_FILIGRANE}" == "true" ]] && [[ -f "${FILIGRANE_IMAGE}" ]]; then\n        # movie= ajoute une 2e entree -> doit utiliser -filter_complex\n        FILTRE_MODE="fc"\n        FILTRE_VALEUR="[0:v]${base}[scaled];"\n        FILTRE_VALEUR+="movie=${FILIGRANE_IMAGE},colorchannelmixer=aa=${FILIGRANE_OPACITE}[logo];"\n        FILTRE_VALEUR+="[scaled][logo]overlay=${FILIGRANE_POSITION}[vout]"\n    else\n        FILTRE_MODE="vf"\n        FILTRE_VALEUR="${base}"\n    fi\n}\n\n# --- Generer le fichier de liste de concatenation FFmpeg ---------------------\n# Format attendu par le demuxeur concat de FFmpeg :\n#   ffconcat version 1.0\n#   file 'http://...'\n#   file 'http://...'\n# Les URLs BTFS sont directement supportees via HTTP.\ngenerer_fichier_concat() {\n    local fichier_out="$1"\n    shift\n    local -a urls=("$@")\n\n    {\n        echo "ffconcat version 1.0"\n        for url in "${urls[@]}"; do\n            echo "file '${url}'"\n            # safe 0 : autoriser les URLs absolues (http://) dans le concat\n            echo "option safe 0"\n        done\n    } > "${fichier_out}"\n}\n\n# --- Lancer FFmpeg en flux continu sur la liste de concat --------------------\n# Un seul processus FFmpeg lit toutes les videos dans l'ordre et encode\n# vers RTMP sans jamais couper le flux.\ndiffuser_flux_continu() {\n    local fichier_concat="$1"\n    local bitrate_video bitrate_audio\n    local url_rtmp_local="rtmp://127.0.0.1:${NGINX_PORT_RTMP}/${NGINX_CHEMIN_APPLICATION}/orbis"\n\n    case "${CIBLE_PLATEFORME}" in\n        dlive)  bitrate_video="${DLIVE_BITRATE_VIDEO}"; bitrate_audio="${DLIVE_BITRATE_AUDIO}" ;;\n        kick)   bitrate_video="${KICK_BITRATE_VIDEO}";  bitrate_audio="${KICK_BITRATE_AUDIO}" ;;\n        *)      bitrate_video="${KICK_BITRATE_VIDEO}";  bitrate_audio="${KICK_BITRATE_AUDIO}" ;;\n    esac\n\n    FILTRE_MODE="vf"\n    FILTRE_VALEUR=""\n    construire_filtre_video\n\n    info "Encodeur  : ${ENCODEUR_VIDEO} | Filtre : ${FILTRE_MODE}"\n    info "Bitrates  : video=${bitrate_video}k audio=${bitrate_audio}k"\n    info "Cible RTMP: ${url_rtmp_local}"\n\n    # -safe 0         : autoriser les chemins absolus (URLs http://) dans concat\n    # -protocol_whitelist : autoriser les protocoles utilises (file + http + btfs)\n    # -re             : lire a vitesse reelle (streaming live)\n    # -fflags +genpts : regenerer les PTS manquants entre les videos\n    local cmd_ffmpeg=(\n        "${FFMPEG}"\n        -hide_banner -loglevel warning -stats\n        -f concat\n        -safe 0\n        -protocol_whitelist "file,http,https,tcp,tls,crypto"\n        -re\n        -fflags +genpts\n        -i "${fichier_concat}"\n    )\n\n    if [[ "${WEBCAM_FILTRE_ACTIF}" == "true" ]]; then\n        cmd_ffmpeg+=(\n            -f v4l2\n            -framerate "${WEBCAM_DEBIT_IMAGES}"\n            -video_size "${WEBCAM_LARGEUR}x${WEBCAM_HAUTEUR}"\n            -i "${WEBCAM_PERIPHERIQUE}"\n        )\n    fi\n\n    if [[ "${FILTRE_MODE}" == "fc" ]]; then\n        cmd_ffmpeg+=(-filter_complex "${FILTRE_VALEUR}" -map "[vout]" -map "0:a")\n    else\n        cmd_ffmpeg+=(-vf "${FILTRE_VALEUR}")\n    fi\n\n    cmd_ffmpeg+=(-c:v "${ENCODEUR_VIDEO}")\n\n    if [[ "${ENCODEUR_VIDEO}" == "libx264" ]]; then\n        cmd_ffmpeg+=(\n            -preset "${PRESET_ENCODAGE}"\n            -profile:v "${PROFIL_H264}" -level:v "${NIVEAU_H264}"\n            -b:v "${bitrate_video}k" -maxrate "${bitrate_video}k"\n            -bufsize "$((bitrate_video * 2))k"\n            -x264-params "nal-hrd=cbr:force-cfr=1"\n            -g "${GOP}" -keyint_min "${GOP}" -sc_threshold 0\n        )\n    elif [[ "${ENCODEUR_VIDEO}" == "h264_v4l2m2m" ]]; then\n        cmd_ffmpeg+=(\n            -b:v "${bitrate_video}k"\n            -maxrate "${bitrate_video}k"\n            -bufsize "$((bitrate_video * 2))k"\n            -g "${GOP}"\n        )\n    fi\n\n    cmd_ffmpeg+=(\n        -r "${DEBIT_IMAGES}"\n        -c:a aac -b:a "${bitrate_audio}k" -ar 44100 -ac 2\n        -flvflags no_duration_filesize\n        -flush_packets 1\n        -f flv "${url_rtmp_local}"\n    )\n\n    debug "Commande FFmpeg concat : ${cmd_ffmpeg[*]}"\n\n    # Afficher la progression en temps reel ET dans le journal\n    local fifo_log pid_tee code_retour\n    fifo_log="$(mktemp -u /tmp/orbis_ffmpeg_XXXXXX.fifo)"\n    mkfifo "${fifo_log}"\n    tee -a "${JOURNAL}" < "${fifo_log}" &\n    pid_tee=$!\n\n    "${cmd_ffmpeg[@]}" 2>"${fifo_log}" &\n    PID_FFMPEG=$!\n\n    code_retour=0\n    wait "${PID_FFMPEG}" || code_retour=$?\n    PID_FFMPEG=""\n\n    wait "${pid_tee}" 2>/dev/null || true\n    rm -f "${fifo_log}"\n    echo "" >&2\n\n    return ${code_retour}\n}\n\n# --- Chargement de la liste de lecture ---------------------------------------\n# Remplit les tableaux globaux LDL_URLS[] et LDL_TITRES[]\nlire_liste_lecture() {\n    local fichier="$1"\n    local ligne url titre\n    local -a idx_melanges urls_tmp titres_tmp\n    local i\n    LDL_URLS=()\n    LDL_TITRES=()\n\n    while IFS= read -r ligne; do\n        [[ -z "${ligne}" ]] && continue\n        [[ "${ligne}" =~ ^[[:space:]]*# ]] && continue\n        url="$(echo "${ligne}" | sed 's/[[:space:]]*#.*//' | xargs)"\n        titre="$(echo "${ligne}" | grep -oP '(?<=#\s{0,5}).*' | xargs 2>/dev/null || true)"\n        [[ -z "${titre}" ]] && titre="$(basename "${url}")"\n        if [[ "${url}" =~ ^https?:// ]]; then\n            LDL_URLS+=("${url}")\n            LDL_TITRES+=("${titre}")\n        fi\n    done < "${fichier}"\n\n    if [[ "${OPT_MELANGE}" == "true" ]]; then\n        info "Melange aleatoire de la liste..."\n        idx_melanges=()\n        urls_tmp=()\n        titres_tmp=()\n        mapfile -t idx_melanges < <(for i in "${!LDL_URLS[@]}"; do echo "$i"; done | shuf)\n        for i in "${idx_melanges[@]}"; do\n            urls_tmp+=("${LDL_URLS[$i]}")\n            titres_tmp+=("${LDL_TITRES[$i]}")\n        done\n        LDL_URLS=("${urls_tmp[@]}")\n        LDL_TITRES=("${titres_tmp[@]}")\n    fi\n}\n\n# --- Verifier l accessibilite de toutes les sources avant de lancer ----------\nverifier_sources() {\n    local url toutes_ok tentative source_ok\n    local -a urls=("$@")\n    toutes_ok=true\n\n    for url in "${urls[@]}"; do\n        tentative=1\n        source_ok=false\n        while (( tentative <= TENTATIVES_RECONNEXION )); do\n            if "${CURL}" -sf --max-time 20 --range "0-511" \\n                    -o /dev/null "${url}" 2>/dev/null; then\n                source_ok=true\n                break\n            fi\n            tentative=$(( tentative + 1 ))\n            sleep 2\n        done\n        if [[ "${source_ok}" == "false" ]]; then\n            avert "Source inaccessible (ignoree) : ${url}"\n            toutes_ok=false\n        else\n            debug "Source OK : ${url}"\n        fi\n    done\n\n    [[ "${toutes_ok}" == "true" ]]\n}\n\n# --- Boucle principale (flux continu, sans coupure entre videos) -------------\nboucle_principale() {\n    # --- Toutes les declarations local au debut de la fonction ---------------\n    # (bash strict mode interdit local avec initialisation dans les boucles)\n    local fichier_concat\n    local tour\n    local continuer\n    local total\n    local i\n    local url\n    local code\n    local essai\n    local diffusion_ok\n    local code_ffmpeg\n    local -a urls_valides\n    local -a titres_valides\n\n    # Tableaux globaux remplis par lire_liste_lecture()\n    declare -g -a LDL_URLS=()\n    declare -g -a LDL_TITRES=()\n\n    info "============================================================"\n    info "  Orbis Alternis -- Demarrage de la diffusion (flux continu)"\n    info "  Liste     : $(basename "${LDL_FICHIER}")"\n    info "  Plateforme: ${CIBLE_PLATEFORME}"\n    info "  Bouclage  : ${OPT_BOUCLE} | Melange : ${OPT_MELANGE}"\n    info "============================================================"\n\n    # Fichier de concatenation temporaire (liste des URLs pour FFmpeg concat)\n    fichier_concat="$(mktemp /tmp/orbis_concat_XXXXXX.txt)"\n    trap "rm -f '${fichier_concat}'" RETURN\n\n    tour=1\n    continuer=true\n\n    while [[ "${continuer}" == "true" ]]; do\n\n        # --- Charger et valider la liste -------------------------------------\n        lire_liste_lecture "${LDL_FICHIER}"\n        total="${#LDL_URLS[@]}"\n\n        if (( total == 0 )); then\n            erreur "La liste de lecture est vide. Arret."\n            break\n        fi\n\n        info "--- Tour ${tour} : ${total} video(s) en flux continu ---"\n\n        # Afficher le plan de diffusion\n        for i in "${!LDL_URLS[@]}"; do\n            info "  $((i+1))/${total} : ${LDL_TITRES[$i]}"\n        done\n\n        # --- Verifier les sources BTFS ---------------------------------------\n        info "Verification des sources BTFS..."\n        urls_valides=()\n        titres_valides=()\n        for i in "${!LDL_URLS[@]}"; do\n            url="${LDL_URLS[$i]}"\n            code="$("${CURL}" -sf --max-time 15 --range "0-511" \\n                -o /dev/null -w "%{http_code}" "${url}" 2>/dev/null || echo "000")"\n            if [[ "${code}" =~ ^2 ]]; then\n                urls_valides+=("${url}")\n                titres_valides+=("${LDL_TITRES[$i]}")\n                debug "  OK (HTTP ${code}) : ${LDL_TITRES[$i]}"\n            else\n                avert "  IGNOREE (HTTP ${code}) : ${LDL_TITRES[$i]} -- ${url}"\n            fi\n        done\n\n        if (( ${#urls_valides[@]} == 0 )); then\n            erreur "Aucune source valide dans ce tour. Attente ${DELAI_RECONNEXION}s..."\n            sleep "${DELAI_RECONNEXION}"\n            if [[ "${OPT_BOUCLE}" == "true" ]]; then\n                tour=$(( tour + 1 ))\n                continue\n            else\n                break\n            fi\n        fi\n\n        # --- Generer le fichier concat pour FFmpeg ---------------------------\n        generer_fichier_concat "${fichier_concat}" "${urls_valides[@]}"\n        debug "Fichier concat :"$'\n'"$(cat "${fichier_concat}")"\n\n        # --- Lancer FFmpeg en flux continu -----------------------------------\n        info "----------------------------------------------------"\n        info "Lancement du flux continu (${#urls_valides[@]} video(s))"\n        info "----------------------------------------------------"\n\n        essai=1\n        diffusion_ok=false\n        code_ffmpeg=0\n        while (( essai <= TENTATIVES_RECONNEXION )); do\n            if diffuser_flux_continu "${fichier_concat}"; then\n                diffusion_ok=true\n                break\n            fi\n            code_ffmpeg=$?\n            avert "Flux interrompu (essai ${essai}/${TENTATIVES_RECONNEXION}, code ${code_ffmpeg})"\n            if (( essai < TENTATIVES_RECONNEXION )); then\n                avert "Reprise dans ${DELAI_RECONNEXION}s..."\n                sleep "${DELAI_RECONNEXION}"\n                generer_fichier_concat "${fichier_concat}" "${urls_valides[@]}"\n            fi\n            essai=$(( essai + 1 ))\n        done\n\n        if [[ "${diffusion_ok}" == "false" ]]; then\n            erreur "Echec definitif du flux apres ${TENTATIVES_RECONNEXION} tentatives."\n        else\n            ok "Tour ${tour} termine (${#urls_valides[@]} video(s) diffusees en flux continu)."\n        fi\n\n        # --- Gestion du bouclage ---------------------------------------------\n        if [[ "${OPT_BOUCLE}" == "true" ]]; then\n            tour=$(( tour + 1 ))\n            info "Reprise du tour ${tour} dans ${DELAI_ENTRE_VIDEOS}s..."\n            sleep "${DELAI_ENTRE_VIDEOS}"\n        else\n            continuer=false\n        fi\n    done\n\n    rm -f "${fichier_concat}" 2>/dev/null || true\n    info "Diffusion terminee."\n}\n\n# --- Point d'entree ----------------------------------------------------------\nmain() {\n    info "Orbis Alternis -- Diffuseur RTMPS/BTFS v1.1 (ARM64)"\n    info "Configuration : ${FICHIER_CONF}"\n    verifier_dependances\n    verifier_cles_flux\n    verifier_btfs\n    verifier_ldl\n    generer_config_nginx\n    demarrer_stunnel\n    find "${REPERTOIRE_JOURNAUX}" -name "*.log" -mtime "+${CONSERVATION_JOURNAUX}" -delete 2>/dev/null || true\n    boucle_principale\n}\n\nmain "$@"\n
+﻿#!/usr/bin/env bash
+# =============================================================================
+# diffuser.sh -- Script principal de diffusion Orbis Alternis
+# =============================================================================
+# Usage : ./diffuser.sh [OPTIONS]
+#
+#   -l <fichier>    Liste de lecture (defaut : ldl/ldl_tot.txt)
+#   -p <cible>      Plateforme : dlive | kick | toutes (defaut : toutes)
+#   -m              Melanger aleatoirement la liste
+#   -b              Forcer le bouclage
+#   -n              Forcer lecture unique sans boucle
+#   -f              Activer le filigrane (logo)
+#   -w              Activer la surcouche webcam
+#   -h              Afficher l'aide
+#
+# Exemples :
+#   ./diffuser.sh
+#   ./diffuser.sh -l ldl/ldl_dystopies.txt -p kick -m
+#   ./diffuser.sh -l ldl/ldl_tot.txt -p toutes -f
+# =============================================================================
+
+# --- Encodage et locale (evite les problemes d'affichage UTF-8 en SSH) -------
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# --- Chemin absolu du projet -------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJET_DIR="$(dirname "${SCRIPT_DIR}")"
+
+# --- Chargement de la configuration ------------------------------------------
+FICHIER_CONF="${PROJET_DIR}/conf/orbis.conf"
+if [[ ! -f "${FICHIER_CONF}" ]]; then
+    echo "[ERREUR] Fichier de configuration introuvable : ${FICHIER_CONF}" >&2
+    exit 1
+fi
+# shellcheck source=../conf/orbis.conf
+source "${FICHIER_CONF}"
+
+# --- Journalisation ----------------------------------------------------------
+mkdir -p "${REPERTOIRE_JOURNAUX}"
+JOURNAL="${REPERTOIRE_JOURNAUX}/diffusion_$(date +%Y%m%d_%H%M%S).log"
+
+_log() {
+    local niveau="$1"; shift
+    local message="$*"
+    local horodatage
+    horodatage="$(date +'%Y-%m-%d %H:%M:%S')"
+    printf "[%s] [%-6s] %s\n" "${horodatage}" "${niveau}" "${message}" | tee -a "${JOURNAL}"
+}
+info()    { _log "INFO"   "$@"; }
+ok()      { _log "OK"     "$@"; }
+avert()   { _log "AVERT"  "$@"; }
+erreur()  { _log "ERREUR" "$@"; }
+debug()   { [[ "${NIVEAU_JOURNAL}" == "DEBUG" ]] && _log "DEBUG" "$@" || true; }
+
+# --- Gestion du signal d'arret -----------------------------------------------
+PID_FFMPEG=""
+FIFO_CONCAT=""
+
+nettoyer() {
+    info "Signal recu -- arret propre en cours..."
+    [[ -n "${PID_FFMPEG}" ]] && kill -SIGTERM "${PID_FFMPEG}" 2>/dev/null && wait "${PID_FFMPEG}" 2>/dev/null || true
+    [[ -n "${FIFO_CONCAT}" ]] && rm -f "${FIFO_CONCAT}" 2>/dev/null || true
+    info "Diffusion arretee proprement."
+    exit 0
+}
+trap nettoyer SIGINT SIGTERM
+
+# --- Valeurs par defaut ------------------------------------------------------
+LDL_FICHIER="${REPERTOIRE_LDL}/ldl_tot.txt"
+CIBLE_PLATEFORME="toutes"
+OPT_MELANGE=false
+OPT_BOUCLE="${BOUCLE}"
+OPT_FILIGRANE="${FILIGRANE_ACTIF}"
+OPT_WEBCAM="${WEBCAM_ACTIF}"
+WEBCAM_FILTRE_ACTIF=false
+
+# --- Analyse des arguments ---------------------------------------------------
+usage() {
+    grep '^#' "${BASH_SOURCE[0]}" | grep -A50 'Usage' | sed 's/^# \?//'
+    exit 0
+}
+
+while getopts ":l:p:mbnfwh" opt; do
+    case "${opt}" in
+        l) LDL_FICHIER="${OPTARG}" ;;
+        p) CIBLE_PLATEFORME="${OPTARG}" ;;
+        m) OPT_MELANGE=true ;;
+        b) OPT_BOUCLE=true ;;
+        n) OPT_BOUCLE=false ;;
+        f) OPT_FILIGRANE=true ;;
+        w) OPT_WEBCAM=true ;;
+        h) usage ;;
+        :) erreur "Option -${OPTARG} requiert un argument."; exit 1 ;;
+        \?) erreur "Option inconnue : -${OPTARG}"; exit 1 ;;
+    esac
+done
+
+# --- Validation des prerequis ------------------------------------------------
+verifier_dependances() {
+    local manquants=()
+    for outil in "${FFMPEG}" "${FFPROBE}" "${CURL}" "${STUNNEL}"; do
+        [[ ! -x "${outil}" ]] && manquants+=("${outil}")
+    done
+    if ! command -v nginx &>/dev/null; then
+        manquants+=("nginx")
+    fi
+    if (( ${#manquants[@]} > 0 )); then
+        erreur "Outils manquants : ${manquants[*]}"
+        erreur "Consultez docs/INSTALLATION.md pour les installer."
+        exit 1
+    fi
+    ok "Toutes les dependances sont presentes."
+}
+
+verifier_cles_flux() {
+    local ok_flux=true
+    if [[ "${CIBLE_PLATEFORME}" =~ ^(dlive|toutes)$ ]] && [[ -z "${DLIVE_CLE_FLUX}" ]]; then
+        erreur "Cle de flux DLive manquante (DLIVE_CLE_FLUX dans orbis.conf)"
+        ok_flux=false
+    fi
+    if [[ "${CIBLE_PLATEFORME}" =~ ^(kick|toutes)$ ]] && [[ -z "${KICK_CLE_FLUX}" ]]; then
+        erreur "Cle de flux Kick manquante (KICK_CLE_FLUX dans orbis.conf)"
+        ok_flux=false
+    fi
+    [[ "${ok_flux}" == "false" ]] && exit 1
+    ok "Cles de flux verifiees."
+}
+
+verifier_ldl() {
+    if [[ ! -f "${LDL_FICHIER}" ]]; then
+        erreur "Liste de lecture introuvable : ${LDL_FICHIER}"
+        exit 1
+    fi
+    local nb_entrees
+    nb_entrees=$(grep -cE '^https?://' "${LDL_FICHIER}" 2>/dev/null || echo 0)
+    if (( nb_entrees == 0 )); then
+        erreur "La liste de lecture est vide ou ne contient pas d'URL valides."
+        exit 1
+    fi
+    ok "Liste de lecture chargee : ${LDL_FICHIER} (${nb_entrees} entrees)"
+}
+
+# =============================================================================
+# verifier_btfs : verifie le daemon BTFS (API port 5001) ET la passerelle
+#                 HTTP fichiers (port 8080) -- deux services distincts !
+#
+# Architecture BTFS :
+#   API   http://127.0.0.1:5001/api/v1/...  -> controle du daemon
+#   GW    http://127.0.0.1:8080/btfs/<HASH> -> acces aux fichiers
+# =============================================================================
+verifier_btfs() {
+    info "Verification du daemon BTFS..."
+
+    # Etape 1 : daemon actif ? (via CLI locale, sans HTTP)
+    if ! command -v btfs &>/dev/null; then
+        erreur "Commande btfs introuvable. Consultez docs/BTFS.md"
+        exit 1
+    fi
+    if ! btfs version &>/dev/null 2>&1; then
+        avert "Daemon BTFS inactif. Tentative de demarrage..."
+        eval "${BTFS_DAEMON_CMD}" &>/dev/null &
+        sleep "${BTFS_DELAI_DEMARRAGE}"
+        if ! btfs version &>/dev/null 2>&1; then
+            erreur "Impossible de demarrer le daemon BTFS."
+            erreur "Lancez manuellement : ${BTFS_DAEMON_CMD}"
+            exit 1
+        fi
+    fi
+    local version_btfs
+    version_btfs=$(btfs version 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+-?[a-zA-Z0-9]*" | head -1 || echo "?")
+    ok "Daemon BTFS actif (v${version_btfs})"
+
+    # Etape 2 : passerelle HTTP fichiers accessible ?
+    # IMPORTANT : en BTFS 4.x, / retourne 401 mais /btfs/<HASH> fonctionne.
+    # On teste donc directement avec un hash reel (les 512 premiers octets).
+    info "Test passerelle HTTP BTFS sur ${BTFS_PASSERELLE}..."
+    local url_test="${BTFS_PASSERELLE}/${BTFS_HASH_TEST}"
+    local code_http
+    code_http=$("${CURL}" -sf --max-time 20 --range "0-511" \
+                -o /dev/null -w "%{http_code}" "${url_test}" 2>/dev/null || echo "000")
+    case "${code_http}" in
+        200|206) ok "Passerelle HTTP BTFS accessible : ${BTFS_PASSERELLE} (HTTP ${code_http})" ;;
+        000)     erreur "Passerelle HTTP BTFS muette sur le port ${BTFS_PORT_PASSERELLE}"
+                 erreur "  ss -tlnp | grep ${BTFS_PORT_PASSERELLE}"
+                 exit 1 ;;
+        401)     erreur "Passerelle HTTP BTFS retourne 401 meme sur les fichiers."
+                 erreur "  Verifiez la config BTFS : btfs config Addresses.Gateway"
+                 exit 1 ;;
+        *)       avert "Passerelle HTTP BTFS : code inattendu ${code_http} (on continue)" ;;
+    esac
+}
+
+# --- Configuration dynamique de nginx-rtmp -----------------------------------
+generer_config_nginx() {
+    info "Configuration nginx (module RTMP)..."
+    local nginx_conf="/etc/nginx/nginx.conf"
+    local rtmp_bloc="/etc/nginx/orbis-rtmp-block.conf"
+    local stats_conf="/etc/nginx/sites-enabled/orbis-stats.conf"
+
+    # --- 1. Nettoyer les fichiers mal places de sessions precedentes -------
+    for f_ancien in "/etc/nginx/sites-enabled/orbis-rtmp.conf" \
+                    "/etc/nginx/sites-enabled/orbis-rtmp"; do
+        [[ -f "${f_ancien}" ]] && sudo rm -f "${f_ancien}" && \
+            info "Ancien fichier supprime : ${f_ancien}"
+    done
+
+    # --- 2. Gestion du module RTMP -----------------------------------------
+    # Sur Raspberry Pi OS, libnginx-mod-rtmp installe automatiquement
+    # /etc/nginx/modules-enabled/50-mod-rtmp.conf (charge via include deja present).
+    # load_module dans nginx.conf est une alternative mais DOIT etre en ligne 1.
+    # On retire toute tentative precedente ratee (load_module mal positionne).
+    if sudo grep -q "load_module.*ngx_rtmp" "${nginx_conf}" 2>/dev/null; then
+        local ligne1
+        ligne1=$(sudo head -1 "${nginx_conf}")
+        if [[ "${ligne1}" =~ load_module.*ngx_rtmp ]]; then
+            ok "Module RTMP : load_module deja en ligne 1 de ${nginx_conf}"
+        else
+            info "Suppression load_module mal positionne dans ${nginx_conf}..."
+            sudo sed -i "/.*load_module.*ngx_rtmp_module.*/d" "${nginx_conf}"
+            info "load_module supprime (le module sera charge via modules-enabled/)"
+        fi
+    fi
+
+    # Verifier que le module est bien charge (via modules-enabled/ ou ligne 1)
+    local module_ok=false
+    if [[ -f /etc/nginx/modules-enabled/50-mod-rtmp.conf ]] || \
+       { [[ -f /usr/lib/nginx/modules/ngx_rtmp_module.so ]] && \
+         [[ -n "$(ls /etc/nginx/modules-enabled/ 2>/dev/null | grep rtmp)" ]]; }; then
+        ok "Module RTMP charge via /etc/nginx/modules-enabled/ (libnginx-mod-rtmp)"
+        module_ok=true
+    fi
+
+    if [[ "${module_ok}" == "false" ]]; then
+        if ! sudo grep -q "^load_module.*ngx_rtmp" "${nginx_conf}"; then
+            sudo sed -i "1s|^|load_module modules/ngx_rtmp_module.so;\n|" "${nginx_conf}"
+            ok "Module RTMP ajoute en ligne 1 de ${nginx_conf}"
+        fi
+    fi
+
+    # --- 3. Generer le bloc rtmp {} avec les vraies valeurs ----------------
+    {
+        echo "# Genere par Orbis Alternis le $(date +'%Y-%m-%d %H:%M:%S')"
+        echo "rtmp {"
+        echo "    server {"
+        echo "        listen ${NGINX_PORT_RTMP};"
+        echo "        chunk_size 4096;"
+        echo "        max_message 1M;"
+        echo ""
+        echo "        application ${NGINX_CHEMIN_APPLICATION} {"
+        echo "            live on;"
+        echo "            record off;"
+        echo "            allow publish 127.0.0.1;"
+        echo "            deny publish all;"
+        echo "            allow play all;"
+        if [[ "${DLIVE_ACTIF}" == "true" ]]; then
+            echo "            push ${DLIVE_SERVEUR}/${DLIVE_CLE_FLUX};"
+        fi
+        if [[ "${KICK_ACTIF}" == "true" ]]; then
+            echo "            push rtmp://127.0.0.1:${STUNNEL_PORT_LOCAL}/app/${KICK_CLE_FLUX};"
+        fi
+        echo "        }"
+        echo "    }"
+        echo "}"
+    } | sudo tee "${rtmp_bloc}" > /dev/null
+    ok "Bloc RTMP genere : ${rtmp_bloc}"
+
+    # --- 4. Inclure le bloc rtmp en fin de nginx.conf (niveau racine) ------
+    if ! sudo grep -q "orbis-rtmp-block.conf" "${nginx_conf}" 2>/dev/null; then
+        printf "\n# Orbis Alternis -- bloc RTMP\ninclude %s;\n" "${rtmp_bloc}" \
+            | sudo tee -a "${nginx_conf}" > /dev/null
+        ok "Include rtmp ajoute dans ${nginx_conf}"
+    else
+        ok "Include rtmp deja present dans ${nginx_conf}"
+    fi
+
+    # --- 5. Serveur HTTP stats (server{} valide dans http{} -> sites-enabled)
+    {
+        echo "server {"
+        echo "    listen 8088;"
+        echo "    server_name localhost;"
+        echo "    location /stat { rtmp_stat all; rtmp_stat_stylesheet stat.xsl; }"
+        echo "    location /controle { rtmp_control all; }"
+        echo "}"
+    } | sudo tee "${stats_conf}" > /dev/null
+    ok "Stats HTTP nginx-rtmp : port 8088"
+
+    # --- 6. Validation et rechargement ------------------------------------
+    if ! sudo nginx -t 2>>"${JOURNAL}"; then
+        erreur "Configuration nginx invalide."
+        erreur "Diagnostic complet : sudo nginx -T 2>&1 | head -50"
+        exit 1
+    fi
+    sudo systemctl reload nginx
+    ok "nginx recharge avec la configuration RTMP."
+}
+
+# --- Demarrage de Stunnel ----------------------------------------------------
+demarrer_stunnel() {
+    if [[ "${KICK_ACTIF}" != "true" ]]; then return 0; fi
+    info "Demarrage de Stunnel (tunnel RTMPS Kick)..."
+    sudo cp "${PROJET_DIR}/conf/stunnel-kick.conf" /etc/stunnel/stunnel.conf
+    sudo systemctl restart stunnel4
+    sleep 2
+    if ! systemctl is-active --quiet stunnel4; then
+        erreur "Stunnel n'a pas pu demarrer. Voir /var/log/stunnel4/stunnel.log"
+        exit 1
+    fi
+    ok "Stunnel actif sur le port local ${STUNNEL_PORT_LOCAL} -> Kick RTMPS"
+}
+
+# =============================================================================
+# ARCHITECTURE FLUX CONTINU (sans coupure entre les videos)
+# =============================================================================
+#
+# Principe : une seule instance FFmpeg tourne en permanence et lit les videos
+# via le demuxeur concat de FFmpeg (liste de fichiers/URLs).
+#
+# Schema :
+#
+#   [bash: boucle LDL] -- genere --> fichier_concat.txt
+#                                           |
+#                                           v
+#   FFmpeg unique : -f concat -i fichier_concat.txt
+#                  -> decode -> filtre -> encode -> RTMP -> nginx -> DLive/Kick
+#
+# Le flux RTMP n'est JAMAIS coupe entre deux videos. La transition est
+# transparente pour les plateformes et les spectateurs.
+# =============================================================================
+
+# --- Construction du filtre video --------------------------------------------
+# Remplit les variables globales FILTRE_MODE et FILTRE_VALEUR
+construire_filtre_video() {
+    local base="scale=w=${LARGEUR_MAX}:h=${HAUTEUR_MAX}:force_original_aspect_ratio=decrease,"
+    base+="pad=${LARGEUR_MAX}:${HAUTEUR_MAX}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+
+    [[ "${OPT_WEBCAM}" == "true" ]] && WEBCAM_FILTRE_ACTIF=true
+
+    if [[ "${OPT_FILIGRANE}" == "true" ]] && [[ -f "${FILIGRANE_IMAGE}" ]]; then
+        # movie= ajoute une 2e entree -> doit utiliser -filter_complex
+        FILTRE_MODE="fc"
+        FILTRE_VALEUR="[0:v]${base}[scaled];"
+        FILTRE_VALEUR+="movie=${FILIGRANE_IMAGE},colorchannelmixer=aa=${FILIGRANE_OPACITE}[logo];"
+        FILTRE_VALEUR+="[scaled][logo]overlay=${FILIGRANE_POSITION}[vout]"
+    else
+        FILTRE_MODE="vf"
+        FILTRE_VALEUR="${base}"
+    fi
+}
+
+# --- Generer le fichier de liste de concatenation FFmpeg ---------------------
+# Format attendu par le demuxeur concat de FFmpeg :
+#   ffconcat version 1.0
+#   file 'http://...'
+#   option safe 0
+#   file 'http://...'
+#   option safe 0
+generer_fichier_concat() {
+    local fichier_out="$1"
+    shift
+    local url
+
+    {
+        echo "ffconcat version 1.0"
+        for url in "$@"; do
+            echo "file '${url}'"
+            echo "option safe 0"
+        done
+    } > "${fichier_out}"
+}
+
+# --- Lancer FFmpeg en flux continu sur la liste de concat --------------------
+# Un seul processus FFmpeg lit toutes les videos dans l'ordre et encode
+# vers RTMP sans jamais couper le flux.
+diffuser_flux_continu() {
+    local fichier_concat="$1"
+    local bitrate_video
+    local bitrate_audio
+    local url_rtmp_local
+    local fifo_log
+    local pid_tee
+    local code_retour
+
+    url_rtmp_local="rtmp://127.0.0.1:${NGINX_PORT_RTMP}/${NGINX_CHEMIN_APPLICATION}/orbis"
+
+    case "${CIBLE_PLATEFORME}" in
+        dlive)  bitrate_video="${DLIVE_BITRATE_VIDEO}"; bitrate_audio="${DLIVE_BITRATE_AUDIO}" ;;
+        kick)   bitrate_video="${KICK_BITRATE_VIDEO}";  bitrate_audio="${KICK_BITRATE_AUDIO}" ;;
+        *)      bitrate_video="${KICK_BITRATE_VIDEO}";  bitrate_audio="${KICK_BITRATE_AUDIO}" ;;
+    esac
+
+    FILTRE_MODE="vf"
+    FILTRE_VALEUR=""
+    construire_filtre_video
+
+    info "Encodeur  : ${ENCODEUR_VIDEO} | Filtre : ${FILTRE_MODE}"
+    info "Bitrates  : video=${bitrate_video}k audio=${bitrate_audio}k"
+    info "Cible RTMP: ${url_rtmp_local}"
+
+    # Construction du tableau de commande FFmpeg
+    local -a cmd_ffmpeg
+    cmd_ffmpeg=(
+        "${FFMPEG}"
+        -hide_banner -loglevel warning -stats
+        -f concat
+        -safe 0
+        -protocol_whitelist "file,http,https,tcp,tls,crypto"
+        -re
+        -fflags +genpts
+        -i "${fichier_concat}"
+    )
+
+    if [[ "${WEBCAM_FILTRE_ACTIF}" == "true" ]]; then
+        cmd_ffmpeg+=(
+            -f v4l2
+            -framerate "${WEBCAM_DEBIT_IMAGES}"
+            -video_size "${WEBCAM_LARGEUR}x${WEBCAM_HAUTEUR}"
+            -i "${WEBCAM_PERIPHERIQUE}"
+        )
+    fi
+
+    if [[ "${FILTRE_MODE}" == "fc" ]]; then
+        cmd_ffmpeg+=(-filter_complex "${FILTRE_VALEUR}" -map "[vout]" -map "0:a")
+    else
+        cmd_ffmpeg+=(-vf "${FILTRE_VALEUR}")
+    fi
+
+    cmd_ffmpeg+=(-c:v "${ENCODEUR_VIDEO}")
+
+    if [[ "${ENCODEUR_VIDEO}" == "libx264" ]]; then
+        cmd_ffmpeg+=(
+            -preset "${PRESET_ENCODAGE}"
+            -profile:v "${PROFIL_H264}"
+            -level:v "${NIVEAU_H264}"
+            -b:v "${bitrate_video}k"
+            -maxrate "${bitrate_video}k"
+            -bufsize "$((bitrate_video * 2))k"
+            -x264-params "nal-hrd=cbr:force-cfr=1"
+            -g "${GOP}"
+            -keyint_min "${GOP}"
+            -sc_threshold 0
+        )
+    elif [[ "${ENCODEUR_VIDEO}" == "h264_v4l2m2m" ]]; then
+        cmd_ffmpeg+=(
+            -b:v "${bitrate_video}k"
+            -maxrate "${bitrate_video}k"
+            -bufsize "$((bitrate_video * 2))k"
+            -g "${GOP}"
+        )
+    fi
+
+    cmd_ffmpeg+=(
+        -r "${DEBIT_IMAGES}"
+        -c:a aac
+        -b:a "${bitrate_audio}k"
+        -ar 44100
+        -ac 2
+        -flvflags no_duration_filesize
+        -flush_packets 1
+        -f flv "${url_rtmp_local}"
+    )
+
+    debug "Commande FFmpeg : ${cmd_ffmpeg[*]}"
+
+    # Afficher la progression en temps reel ET dans le journal via FIFO
+    fifo_log="$(mktemp -u /tmp/orbis_ffmpeg_XXXXXX.fifo)"
+    mkfifo "${fifo_log}"
+    tee -a "${JOURNAL}" < "${fifo_log}" &
+    pid_tee=$!
+
+    "${cmd_ffmpeg[@]}" 2>"${fifo_log}" &
+    PID_FFMPEG=$!
+
+    code_retour=0
+    wait "${PID_FFMPEG}" || code_retour=$?
+    PID_FFMPEG=""
+
+    wait "${pid_tee}" 2>/dev/null || true
+    rm -f "${fifo_log}"
+    echo "" >&2
+
+    return ${code_retour}
+}
+
+# --- Chargement de la liste de lecture ---------------------------------------
+# Remplit les tableaux globaux LDL_URLS[] et LDL_TITRES[]
+lire_liste_lecture() {
+    local fichier="$1"
+    local ligne
+    local url
+    local titre
+
+    LDL_URLS=()
+    LDL_TITRES=()
+
+    while IFS= read -r ligne; do
+        [[ -z "${ligne}" ]] && continue
+        [[ "${ligne}" =~ ^[[:space:]]*# ]] && continue
+        url="$(echo "${ligne}" | sed 's/[[:space:]]*#.*//' | xargs)"
+        titre="$(echo "${ligne}" | grep -oP '(?<=#\s{0,5}).*' | xargs 2>/dev/null || true)"
+        [[ -z "${titre}" ]] && titre="$(basename "${url}")"
+        if [[ "${url}" =~ ^https?:// ]]; then
+            LDL_URLS+=("${url}")
+            LDL_TITRES+=("${titre}")
+        fi
+    done < "${fichier}"
+
+    if [[ "${OPT_MELANGE}" == "true" ]]; then
+        info "Melange aleatoire de la liste..."
+        local i
+        local -a idx_melanges
+        local -a urls_tmp
+        local -a titres_tmp
+
+        idx_melanges=()
+        urls_tmp=()
+        titres_tmp=()
+
+        mapfile -t idx_melanges < <(for i in "${!LDL_URLS[@]}"; do echo "$i"; done | shuf)
+        for i in "${idx_melanges[@]}"; do
+            urls_tmp+=("${LDL_URLS[$i]}")
+            titres_tmp+=("${LDL_TITRES[$i]}")
+        done
+        LDL_URLS=("${urls_tmp[@]}")
+        LDL_TITRES=("${titres_tmp[@]}")
+    fi
+}
+
+# --- Boucle principale (flux continu, sans coupure entre videos) -------------
+boucle_principale() {
+    local fichier_concat
+    local tour
+    local continuer
+    local total
+    local i
+    local url
+    local code
+    local essai
+    local diffusion_ok
+    local code_ffmpeg
+
+    # Tableaux globaux remplis par lire_liste_lecture()
+    declare -g -a LDL_URLS=()
+    declare -g -a LDL_TITRES=()
+
+    # Tableaux locaux pour les URLs/titres valides du tour courant
+    local -a urls_valides
+    local -a titres_valides
+
+    info "============================================================"
+    info "  Orbis Alternis -- Demarrage de la diffusion (flux continu)"
+    info "  Liste     : $(basename "${LDL_FICHIER}")"
+    info "  Plateforme: ${CIBLE_PLATEFORME}"
+    info "  Bouclage  : ${OPT_BOUCLE} | Melange : ${OPT_MELANGE}"
+    info "============================================================"
+
+    # Fichier de concatenation temporaire (liste des URLs pour FFmpeg concat)
+    fichier_concat="$(mktemp /tmp/orbis_concat_XXXXXX.txt)"
+
+    tour=1
+    continuer=true
+
+    while [[ "${continuer}" == "true" ]]; do
+
+        # --- Charger et valider la liste ------------------------------------
+        lire_liste_lecture "${LDL_FICHIER}"
+        total="${#LDL_URLS[@]}"
+
+        if (( total == 0 )); then
+            erreur "La liste de lecture est vide. Arret."
+            break
+        fi
+
+        info "--- Tour ${tour} : ${total} video(s) en flux continu ---"
+
+        for i in "${!LDL_URLS[@]}"; do
+            info "  $((i+1))/${total} : ${LDL_TITRES[$i]}"
+        done
+
+        # --- Verifier les sources BTFS -------------------------------------
+        info "Verification des sources BTFS..."
+        urls_valides=()
+        titres_valides=()
+
+        for i in "${!LDL_URLS[@]}"; do
+            url="${LDL_URLS[$i]}"
+            code="$("${CURL}" -sf --max-time 15 --range "0-511" \
+                -o /dev/null -w "%{http_code}" "${url}" 2>/dev/null || echo "000")"
+            if [[ "${code}" =~ ^2 ]]; then
+                urls_valides+=("${url}")
+                titres_valides+=("${LDL_TITRES[$i]}")
+                debug "  OK (HTTP ${code}) : ${LDL_TITRES[$i]}"
+            else
+                avert "  IGNOREE (HTTP ${code}) : ${LDL_TITRES[$i]} -- ${url}"
+            fi
+        done
+
+        if (( ${#urls_valides[@]} == 0 )); then
+            erreur "Aucune source valide dans ce tour. Attente ${DELAI_RECONNEXION}s..."
+            sleep "${DELAI_RECONNEXION}"
+            if [[ "${OPT_BOUCLE}" == "true" ]]; then
+                tour=$(( tour + 1 ))
+                continue
+            else
+                break
+            fi
+        fi
+
+        # --- Generer le fichier concat pour FFmpeg -------------------------
+        generer_fichier_concat "${fichier_concat}" "${urls_valides[@]}"
+        debug "Fichier concat : $(cat "${fichier_concat}")"
+
+        # --- Lancer FFmpeg en flux continu ---------------------------------
+        info "----------------------------------------------------"
+        info "Lancement du flux continu (${#urls_valides[@]} video(s))"
+        info "----------------------------------------------------"
+
+        essai=1
+        diffusion_ok=false
+        code_ffmpeg=0
+
+        while (( essai <= TENTATIVES_RECONNEXION )); do
+            if diffuser_flux_continu "${fichier_concat}"; then
+                diffusion_ok=true
+                break
+            fi
+            code_ffmpeg=$?
+            avert "Flux interrompu (essai ${essai}/${TENTATIVES_RECONNEXION}, code ${code_ffmpeg})"
+            if (( essai < TENTATIVES_RECONNEXION )); then
+                avert "Reprise dans ${DELAI_RECONNEXION}s..."
+                sleep "${DELAI_RECONNEXION}"
+                generer_fichier_concat "${fichier_concat}" "${urls_valides[@]}"
+            fi
+            essai=$(( essai + 1 ))
+        done
+
+        if [[ "${diffusion_ok}" == "false" ]]; then
+            erreur "Echec definitif du flux apres ${TENTATIVES_RECONNEXION} tentatives."
+        else
+            ok "Tour ${tour} termine (${#urls_valides[@]} video(s) diffusees en flux continu)."
+        fi
+
+        # --- Gestion du bouclage -------------------------------------------
+        if [[ "${OPT_BOUCLE}" == "true" ]]; then
+            tour=$(( tour + 1 ))
+            info "Reprise du tour ${tour} dans ${DELAI_ENTRE_VIDEOS}s..."
+            sleep "${DELAI_ENTRE_VIDEOS}"
+        else
+            continuer=false
+        fi
+
+    done
+
+    rm -f "${fichier_concat}" 2>/dev/null || true
+    info "Diffusion terminee."
+}
+
+# --- Point d'entree ----------------------------------------------------------
+main() {
+    info "Orbis Alternis -- Diffuseur RTMPS/BTFS v1.1 (ARM64)"
+    info "Configuration : ${FICHIER_CONF}"
+    verifier_dependances
+    verifier_cles_flux
+    verifier_btfs
+    verifier_ldl
+    generer_config_nginx
+    demarrer_stunnel
+    find "${REPERTOIRE_JOURNAUX}" -name "*.log" -mtime "+${CONSERVATION_JOURNAUX}" -delete 2>/dev/null || true
+    boucle_principale
+}
+
+main "$@"
